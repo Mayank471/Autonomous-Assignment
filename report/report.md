@@ -1,731 +1,399 @@
 # Multiagent Plan Repair in an Automated Warehouse
 
-*Autonomous Systems — plan generation, disruption, and distributed repair*
+*Autonomous Systems assignment -- minimum-change plan repair by negotiation*
 
 ---
 
-## 1. Problem
-
-A team of robots works the floor of an automated warehouse laid out as a 2D
-grid. Each robot starts at a dock, is assigned a set of objects to collect, and
-must carry each to its delivery station. Routes are planned centrally at the
-start with a multiagent pathfinding algorithm, and are collision-free by
-construction.
-
-Then the environment refuses to cooperate. A shelf collapses and a grid cell
-becomes impassable; a robot breaks down where it stands and becomes an obstacle
-with unfinished work on its hands; an emergency appears somewhere on the floor
-and someone has to attend to it now. Plans that were valid a moment ago are not.
-
-The system must respond by **repairing** the affected plans, subject to three
-constraints that between them define the problem:
-
-1. the disrupted agents negotiate with **neighbouring agents** to agree
-   alternative paths;
-2. the repair must **not re-invoke the multiagent plan generation algorithm**
-   from scratch;
-3. the repair should **minimise the number of agents whose original plans are
-   altered**.
-
-and it is evaluated on:
-
-* the **total time steps** required by all agents to accomplish their tasks;
-* the **number of agents whose plans change** to handle a single disruption;
-* how both **scale** with the number of agents and with the density of dynamic
-  obstacles.
-
-## 2. Background, and where the design comes from
-
-The design is assembled from the taught material rather than invented alongside
-it. Two chapters of Weiss do most of the work, and the textbook itself supplies
-the join between them. Discussing the multiagent plan coordination problem, it
-observes (p497):
-
-> "this view of multiagent planning is compatible with a distributed constraint
-> satisfaction formulation, **where the variables are the agents' plans, and the
-> constraints enforce that the plans dovetail together suitably**."
-
-That sentence is the thesis of this implementation. A repair episode is treated
-as a distributed constraint optimization problem in exactly those terms: the
-variables are the agents' candidate plans, the constraints forbid plans that
-collide, and — the part the assignment cares about — *minimising how many agents
-are altered* is written into the objective function rather than hoped for.
-
-### 2.1 What Chapter 11 supplies
-
-**Coordination prior to local planning (§3).** Some coordination is cheapest
-done once, at design time. Social laws (§3.1) are conventions that "relieve
-agents of the burden of explicitly coordinating"; here that is one-way aisles.
-Organizational structuring (§3.2) provides roles and authority; here that is a
-zone decomposition and a ranking over agents. The contract-net protocol (§3.3)
-handles task reallocation; here it re-auctions a broken robot's remaining work.
-
-**Local planning prior to coordination (§4).** The initial plan follows the
-chapter's own two-phase structure. Every agent first plans its route alone; the
-union of those routes is the initial, uncoordinated multiagent plan — the
-analogue of the flawed parallel plan in Figure 11.4 — and coordination then
-resolves the interactions. Algorithm 11.2's step 5 describes the resolution
-protocol used: agents form a total order, the superior sends down its plan, and
-inferiors change theirs to work with it while double-checking against previous
-superiors. Prioritized planning is precisely that protocol.
-
-**Execution (§6).** Section 6.2 states the dilemma this assignment is built
-around, and warns about the trap:
-
-> "Plan repair is potentially more cost-efficient, but more complicated. If only
-> some agents need to repair their plans (the others have not deviated), repair
-> nonetheless could involve all of the agents as the repaired plans need to be
-> coordinated with others' unchanged plans. This could lead to others needing to
-> change their plans, **in a chain reaction** of planning and coordination
-> efforts."
-
-Bounding that chain reaction is the central engineering problem, and §6.3's
-account of **partial global planning** supplies the means. PGP's six mechanisms
-map onto the repair layer one for one:
-
-| PGP mechanism (p530–531) | In this system |
-|---|---|
-| **Abstraction** — agents exchange "what partial interpretations they plan to construct and when", not their detailed plans | agents exchange zone-occupancy intervals `(zone, enter, exit)`, ~6× smaller than the cell path, and negotiate over those |
-| **Decentralization** — a meta-level organization defining "roles, protocols, and authority structures" | an authority ranking inherited from the planning priority; the disrupted agent mediates its own episode |
-| **Partial global reasoning** — combine others' abstract plans with your own and search modifications "in a greedy hill-climbing fashion" | the `greedy_pgp` strategy, literally that |
-| **Communication planning** | messages are explicit objects and are counted as a metric |
-| **Asynchrony** — "agents cannot afford to wait for convergence" | uninvolved agents keep executing throughout a repair; there is no barrier |
-| **Dampened responsiveness** — "if an abstract plan step will occur earlier or later than expected by more than a parameterized number of time steps, then the agent should alert others" | the threshold `tau`; changes below it are absorbed and never broadcast |
-
-### 2.2 What Chapter 12 and the ADOPT paper supply
-
-Chapter 12 gives the formal object: a constraint network `N = <X, D, C>` with
-variables partitioned among agents, where "two agents are considered neighbors if
-there is at least one constraint that depends on variables that each controls"
-and "only neighboring agents can directly communicate with each other". Hard
-constraints are encoded as soft ones priced prohibitively (p550), which is how
-collisions are expressed here.
-
-ADOPT itself was taught from Modi, Shen, Tambe and Yokoo (2005) rather than from
-the textbook, and both presentations are reproduced (§5). Its three components —
-local lower-bound estimates, backtrack thresholds, and bound-interval termination
-— are implemented as described, with `VALUE`, `COST`, `THRESHOLD` and `TERMINATE`
-messages over a DFS pseudo-tree, and the paper's bounded-error extension
-(`min(LB + b, UB) = threshold` at the root) is available as a real-time escape
-hatch.
-
-The target-tracking problem of §3.1.2 is used twice: as a standalone
-demonstration, and as the actual mechanism for deciding which robots divert to an
-emergency.
-
----
-
-## 3. System design
-
-### 3.1 The warehouse
-
-A Kiva-style floor: shelf blocks in a lattice of single-width aisles, ringed by a
-two-wide highway. The default layout is 50×60 with 1650 free cells, 12 delivery
-stations and 216 perimeter docking bays.
-
-One modelling decision shapes everything downstream. An agent that finishes its
-route **stays on its final cell for the rest of the run**, so that cell is a
-*permanent* reservation. With far fewer delivery stations than agents, parking on
-one would make it unreachable for every agent routed there afterwards — they
-could never complete. Agents therefore return to a **dedicated dock**, placed on
-the outermost ring where reserving it cannot disconnect the floor (the inner
-highway row still joins every aisle). This single change took the 30-agent
-instance from repeated planning failures at 73 s to a clean solution in 0.11 s.
-
-### 3.2 Initial plan generation
-
-Space-Time A\* over `(cell, time)` states with wait actions, guided by an exact
-backward-BFS distance-to-goal cached per goal. Other agents enter only through a
-reservation table holding vertex, edge (head-on swap) and permanent reservations,
-so the same routine serves independent planning, prioritized planning and repair
-unchanged. Agents are then planned in priority order, longest route first, with
-randomised priority restarts on failure.
-
-### 3.3 The repair layer
-
-When a disruption lands:
-
-1. **Detect** which agents' remaining plans it invalidated (§6.1 monitoring).
-2. **Gather a neighbourhood.** Agents are linked when their zone-time intervals
-   overlap within a window around the disruption; a ring is grown outward from
-   the disrupted agents, strongest interaction first, capped at `k_max`. Working
-   from abstract plans makes this one pass over intervals rather than an
-   all-pairs comparison of paths.
-3. **Generate options locally.** Each agent produces its own small domain, in
-   increasing order of disturbance: `keep`, `wait_k` (a pure delay insertion —
-   the route is untouched, every step happens `k` ticks later), `splice`,
-   `detour`, and `reroute` only if none of those worked.
-4. **Add one coordinated option per agent** (§3.4).
-5. **Negotiate**, by hill-climbing or by ADOPT.
-6. **Commit atomically**, leaving uninvolved agents running.
-
-**Splicing is the heart of "repair, not replan".** Only the leg the agent is
-currently flying is re-planned; the remainder of its route is reattached where
-that leg ends, sliding later in time to meet it. That is one search instead of
-one per remaining waypoint. It is also where nearly all the system's cost used to
-sit: replacing full rerouting with splicing cut a 20-agent run from 39.5 s to
-2.9 s, a factor of 14.
-
-### 3.4 Making the DCOP feasible
-
-Generating each agent's options independently is not a convenience, it is what
-the DCOP formulation demands: no agent may enumerate anyone else's choices. But
-that has a consequence which is easy to miss, and which only surfaced once the
-system was measured rather than reasoned about.
-
-Several agents in a neighbourhood routinely plan through the same free corridor,
-because each is planning around the *uninvolved* fleet and is blind to the
-others' options. Their candidates therefore collide with one another, and with
-only a handful of options each there may be **no collision-free combination at
-all**. Instrumenting a 16-agent floor showed 13 of 16 episodes had no feasible
-joint assignment: the solver's answer was rejected as unsafe and the sequential
-fallback quietly did the real work 62% of the time. The negotiation was
-decorative — which also explains why the `beta` knob appeared to do nothing, as
-the assignment it influenced was being discarded.
-
-The fix is one further option per agent, planned in the meta-level
-organization's authority order against everything already settled: the superior
-commits, and each inferior adapts around it. That is precisely Algorithm 11.2's
-step 5, but offered as a *candidate* rather than imposed as the outcome. It makes
-"everybody takes their coordinated plan" feasible by construction, so the DCOP
-starts from a solvable problem and searches for something strictly better —
-fewer agents disturbed, less delay — instead of failing and being overruled.
-Afterwards every episode was feasible, the fallback stopped firing, and both the
-churn and the total cost improved.
-
-### 3.5 The repair DCOP
-
-For each involved agent `i`, variable `x_i` ranges over its candidate plans.
-
-* **Binary constraints.** `F_ij(a, b) = conflict_cost` when plans `a` and `b`
-  collide in space-time, else 0 — a hard constraint encoded as a soft one, per
-  p550. Pairs with no colliding combination get no edge, keeping the graph as
-  sparse as the problem really is.
-* **Unary costs.** `f_i(a) = alpha · delay(a) + beta · [a ≠ keep]`.
-
-The `beta` term **is** the assignment's "minimise the number of agents whose
-original plans are altered", stated as an objective. At `beta = 0` the system
-buys any time saving with any amount of churn; as `beta` rises it will accept a
-slower joint plan in exchange for leaving more agents alone. Sweeping it traces
-the trade-off directly (§6.4).
-
-Delay is measured against each agent's *own best* option rather than its current
-plan, which keeps every cost non-negative — a requirement of ADOPT, not a detail
-(§5.3) — while shifting the objective only by a constant per agent, so the
-optimal joint assignment is unchanged.
-
-### 3.6 Bounding the chain reaction
-
-Three mechanisms bound propagation, which is what §6.2 warns is otherwise
-unbounded:
-
-* `k_max` caps a single negotiation group.
-* A disruption invalidating more plans than one group can hold is repaired in
-  **successive small groups**, each committing before the next begins — local
-  huddles rather than one fleet-wide meeting. This matters for tractability: a
-  breakdown in a busy aisle routinely invalidates a dozen plans, and a complete
-  DCOP solver cannot cope with a dense thirteen-variable problem.
-* `tau` suppresses announcements of changes too small to matter.
-
-### 3.7 Handling each kind of disruption
-
-**Cell blockage** — a permanent vertex constraint from that time on; every agent
-routed through it is a trigger.
-
-**Agent breakdown** — the agent freezes and its cell becomes an obstacle; its
-unfinished tasks are re-auctioned by contract net, with bids priced at the
-marginal cost of accepting; agents routed through its cell are triggers.
-
-**Emergency task** — posed as the target-tracking DCOP of Ch 12 §3.1.2, with the
-mapping: robots are sensors, "which target to aim at" is the response modality,
-overlapping sensing range is "can reach the emergency in time", and the energy
-cost of aiming is the delay to that robot's own deliveries. The chosen responders
-get the emergency spliced to the front of their queues, and an ordinary repair
-episode re-plans them.
-
-### 3.8 What happens when repair fails
-
-An agent that cannot complete its route has to go *somewhere*, and "stop where
-you are" is not safe: a stationary robot occupies its cell forever, so any agent
-already routed through that cell later would drive into it. Parking is a planning
-problem in its own right. The fallback order is: route to the agent's own dock
-(safe by construction, since a dock is exclusive to it); else advance as far as
-it can and stop somewhere holdable; else stand still, but only if standing still
-is verified safe.
-
-Likewise, a negotiated assignment is never trusted to be feasible: when every
-joint choice in the domains collides, an optimal solver returns the least-bad
-one, not a legal one. Every result is checked, and anything that fails falls back
-to sequential local repair — still bounded to the episode's agents, but
-collision-free by construction. How often that happens is reported, not hidden.
-
-Even with all of that, a first sweep of 1440 runs turned up twelve in which a
-collision survived, every one of them on a badly degraded floor with many
-stranded agents. The cause was the last rung of the parking ladder: when an
-agent's dock was unreachable *and* every nearby cell was already spoken for, it
-was left standing where it was, unchecked. Widening that search fixed the cases
-observed, but "fixed the cases observed" is not an invariant, so the simulator
-now also runs a final pass that rebuilds the joint plan in authority order and
-trims any agent that cannot be accommodated — a queue forming behind a stalled
-robot. It terminates because plans only ever shorten, it leaves conflict-free
-plans untouched, and how often it has to intervene is itself a reported metric.
-
----
-
-## 4. The five strategies
-
-| | Negotiates? | Searches | Role |
-|---|---|---|---|
-| `selfish` | no | — | Only disrupted agents replan, against everyone else held fixed. Lower bound on agents changed. |
-| `greedy_pgp` | yes | fixed candidate set | PGP mechanism 3: distributed hill-climbing in authority order. |
-| `adopt` | yes | fixed candidate set | The same repair as a DCOP, solved optimally by ADOPT. |
-| `cbs` | yes | the plan space | Conflict-Based Search over the neighbourhood. **Outside the syllabus** — see §4.1. |
-| `full_replan` | — | the plan space | Prioritized replanning of the whole fleet. The baseline the assignment says to avoid. |
-
-All five receive the same scenarios and the same disruption schedules, so
-differences are attributable to the repair alone.
-
-### 4.1 Going outside the syllabus: Conflict-Based Search
-
-The four syllabus strategies share a limitation that only became visible once
-the system was measured. The DCOP formulation asks each agent for a handful of
-candidate plans and then asks which combination fits. That is exactly what Ch 12
-prescribes — an agent controls its own variable and knows nothing of anyone
-else's options — but it means the negotiation can only ever choose among about
-five plans per agent. When no combination of those is collision-free, agents
-abandon their remaining tasks and retreat.
-
-The consequence was stark: across 1152 disrupted runs the negotiated strategies
-stranded **more** agents than the naive `selfish` baseline (14.25 against 11.90)
-and abandoned roughly nine agents' tasks per run. Losing to the do-nothing
-baseline on task completion is not a parameter that needs tuning; the search
-space is simply too small.
-
-**Conflict-Based Search** (Sharon, Stern, Felner and Sturtevant, *Artificial
-Intelligence* 219, 2015) removes that limitation. It does not enumerate plans in
-advance. Its high level searches a tree of *constraints*: find a conflict
-between two agents, branch by forbidding one of them from that cell at that
-time, and replan just that agent. The reachable space is therefore every plan,
-not a sample of five, and CBS is complete — if a collision-free joint plan
-exists for those agents, it finds one. No agent gives up merely because the
-options it happened to generate did not fit together.
-
-It also turns out to suit this assignment's objective unusually well, and for
-free. The root node holds the agents' *current* plans, and an agent is replanned
-only when a constraint is placed on it — so an agent not party to any conflict
-is never touched. The set of agents that change is exactly the set the conflicts
-reach. Where the DCOP has to *price* churn through `beta` and hope the optimum
-lands somewhere sensible, CBS minimises it structurally.
-
-Two costs come with it. CBS is exponential in the number of conflicts, so the
-search is bounded and falls back to sequential local repair when the bound is
-hit; and it is a centralised search over the neighbourhood, so unlike ADOPT it
-is not a distributed algorithm. It is bolted onto the same neighbourhood
-machinery — the same interaction graph, the same `k_max`, the same commit path —
-so the comparison isolates the search and nothing else.
-
-**Adaptive escalation.** Because CBS searches the real plan space, a failure is
-evidence that the *neighbourhood* was too narrow rather than that no repair
-exists. So a failed CBS episode is retried on a wider ring before giving up,
-which turns `k_max` from a fixed guess into a floor. This is only worth doing
-for a solver that can exploit the extra room; retrying a fixed candidate set on
-more agents mostly just costs more.
-
----
-
-## 5. Validation
-
-### 5.1 ADOPT against Weiss Figure 12.1
-
-The implementation reproduces the taught example exactly: the DFS pseudo-tree of
-Figure 12.2 (x1 root, x2 and x3 its children, x4 under x2, and **x1 as x4's
-pseudo-parent** — which is the figure's own point about why x1 sends x4 a `VALUE`
-message despite not being its parent); the local costs quoted on p558
-(`δ(x4=0) = 4`, `δ(x4=1) = 0` under context `{x1=0, x2=0}`; `δ(x2=0) = 2`,
-`δ(x2=1) = 0` under `{x1=0}`); and the optimum of 1, confirmed against exhaustive
-search. All four message types are exercised, and `LB = UB = 1` at termination.
-
-### 5.2 ADOPT against Modi et al. Figure 2
-
-The paper's example is a **different network**: its edges are x1-x2, x1-x3,
-x2-x3, x2-x4, so "x1 and x3 are neighbors but x1 and x4 are not" — the reverse of
-the textbook — and its cost function is `f(0,0)=1, f(0,1)=f(1,0)=2, f(1,1)=0`.
-Both of the totals the paper quotes are reproduced (`F(all 0) = 4`,
-`F(all 1) = 0`), as is the DFS tree of Fig. 2(b) (x1 root, x1 parent of x2, x2
-parent of both x3 and x4, x1 pseudo-parent of x3) and the stated optimum
-`A* = {(x1,1), (x2,1), (x3,1), (x4,1)}` at cost 0 — found whichever agent is
-chosen as root.
-
-The paper's §6 bounded-error extension is implemented as specified, relaxing the
-**root's** threshold invariant to `min(LB + b, UB)` while every other agent keeps
-the strict one. That placement is what preserves the guarantee: the cost returned
-is the root's own upper bound, so it is provably within `b` of the optimum.
-
-### 5.3 A trap worth recording
-
-ADOPT initialises every child's lower bound to 0 and refines upward. That is only
-an admissible bound if no subtree can cost *less* than 0 — so a **negative cost
-silently breaks optimality**, closing `LB = UB` on a suboptimal answer. The
-target-tracking formulation hit this: written naturally as a reward of `-10` for
-a covered target, ADOPT confidently returned "all sensors idle". Re-baselining it
-as the *cost of not covering* (0 when a pair agrees, `reward` otherwise) is a
-constant shift per edge, leaves the optimum unchanged, and is non-negative.
-`solve_adopt` now refuses negative costs outright rather than returning a wrong
-answer quietly.
-
-### 5.4 Safety of the repaired plans
-
-The property that matters most: **after every disruption is repaired, the joint
-plan contains no vertex or edge collision** — for every strategy, across seeds
-and obstacle densities, checked mid-run rather than only at the end. A repair
-that produced a faster schedule by driving two robots through each other would
-not be a repair.
-
-Also asserted: agents never teleport or stand on a shelf; the local strategies
-**never call global plan generation** (the assignment's core constraint, asserted
-rather than assumed); negotiation groups never exceed `k_max`; raising `beta`
-never increases churn; raising `tau` never increases what is broadcast; and an
-undisrupted run completes every task with no repairs at all.
-
-### 5.5 Determinism
-
-Every configuration must be reproducible from its seed, or the evaluation means
-nothing. That is asserted rather than assumed, and the assertion earned its
-keep: the first version of CBS bounded its search by **wall-clock time**, which
-bounds cost correctly but makes the result depend on how busy the machine is.
-Two runs of one configuration, same seed, same scenario, disagreed by 34
-percentage points of task completion (54% against 86%) — and neither run looked
-anomalous on its own. It was caught only because a repeat happened to disagree
-with itself.
-
-The bound is now on *low-level searches*, a quantity the search counts itself,
-and `test_cbs_is_deterministic` checks three consecutive runs agree exactly. The
-general lesson: a real-time bound is the right engineering choice for a
-deployed repair layer and the wrong one for a measured one, and if a system is
-going to be evaluated then reproducibility has to outrank realism.
-
-### 5.6 What the tests missed, and what found it
-
-Worth recording, because it shaped the final design. The test suite ran the
-safety invariant over dozens of scenarios and passed — and the invariant was
-still being violated. A sweep of 1440 runs found twelve in which a collision
-survived, every one at 60–80 agents on a heavily blocked floor.
-
-The tests use 12–16 agents on a 30×36 floor, which keeps the suite fast, and at
-that size the failing path essentially never fires: it needs an agent whose dock
-is unreachable *and* whose every nearby cell is already claimed. That only
-happens when the floor is both crowded and badly degraded. The bug was not
-subtle once seen, but it was invisible at test scale.
-
-Two conclusions were drawn and applied. The first is that a repair layer which
-can *fabricate* a plan when it fails is worse than one that reports failure: the
-fabricated plan satisfies every downstream check while being physically wrong, so
-the error surfaces far from its cause. `find_refuge` now returns `None` rather
-than inventing a standstill, and its callers must decide what to do. The second
-is that when placing agents that cannot move, ordering matters more than
-seniority — an immovable agent is an obstacle, not a participant, and must be
-placed before the movers so they route around it. Ordering by authority instead
-let a senior mover claim the cell a stalled agent was standing on, which is
-unfixable on that pass.
-
-The large-scale sweep is therefore not only the evaluation; it is also the only
-thing that exercised these paths at all.
-
----
-
-## 6. Experimental setup
-
-**Layout.** A 50x60 Kiva warehouse: 1650 free cells, 1020 shelf-access points,
-12 delivery stations, 216 perimeter docking bays, single-width aisles.
-
-**Fleet.** 10 to 80 agents, three pickup-and-delivery tasks each, so the largest
-configuration is 240 tasks over 480 waypoints.
-
-**Disruption density.** The fraction of free cells that become permanently
-blocked over a run, swept over 0, 0.01, 0.02, 0.03 and 0.04. The top of that
-range walls off about 65 cells of 1650 — a severe incident, not a mild one. Going
-much further stops measuring plan repair and starts measuring how long a
-destroyed warehouse takes to grind to a halt. Roughly 70% of events are cell
-blockages, 15% agent breakdowns and 15% emergency tasks, drawn with a bias
-toward cells the fleet actually intends to use: a blockage on a cell nobody was
-going to visit is not a disruption at all.
-
-**Repetitions.** Twelve seeds per configuration, 1672 runs in total. Every
-strategy is replayed against an identical scenario and an identical disruption
-schedule, drawn once up front, so a paired comparison is valid. Error bars are
-95% confidence intervals over seeds.
-
-**Defaults.** `k_max = 6`, `alpha = 1`, `beta = 4`, `tau = 0`, `epsilon = 0`
-(ADOPT exact), social laws off, with each swept separately.
-
-**Metrics.** Total time steps summed over agents; agents whose plan changed per
-disruption; agents consulted per disruption; largest negotiation group; repair
-wall-clock time and message count; tasks completed; agents stranded; and — as a
-correctness check rather than a result — collisions in the final joint plan.
-
-An agent that never finishes is charged to the end of the run rather than having
-its clock stopped early, so a strategy cannot look fast by stranding agents.
-Emergency tasks are added to the task denominator, so completion rates cannot
-exceed 100% by counting extra work.
-
-### 6.1 A caveat on the impact metric
-
-"Agents whose plans change per disruption" is the number the assignment asks
-for, and taken alone it is **misleading**. A strategy scores well on it by
-repairing efficiently — or by giving up.
-
-The clearest case came from the hardest configuration tested, 80 agents on a
-floor with 4% of its cells blocked:
-
-| | agents changed | tasks completed | stranded |
-|---|---|---|---|
-| ADOPT | **4.10** | **12%** | 63 of 80 |
-| CBS | 6.70 | **74%** | 31 of 80 |
-
-ADOPT looks 40% better on the metric the assignment names. It achieves that by
-abandoning: agents give up their tasks and park, and a parked agent's plan never
-needs changing again. The fleet delivered an eighth of its work.
-
-So every impact figure in what follows is reported next to task completion, and
-neither should be read without the other. A repair layer that changes nobody's
-plan because nobody is still trying to do anything is not a good repair layer.
-
----
+## 1. Problem and assumptions
+
+Robots work on a warehouse floor laid out as a 2D grid. Each robot starts at its
+own dock and must pick up a set of assigned objects and carry each to a delivery
+station. Paths come from a multi-agent path-finding (MAPF) planner. While the
+robots execute them, three kinds of disruption occur: a **cell is suddenly
+blocked**, a **robot breaks down**, or a robot is given a **high-priority
+emergency task**.
+
+The repair must:
+
+1. be negotiated between the disrupted agents and their neighbours;
+2. never re-run the plan generator from scratch;
+3. **minimise the number of agents whose plans are altered**.
+
+It is evaluated on **total time steps**, on **the number of agents changed per
+disruption**, and on how both scale with **the number of agents** and **the
+density of dynamic obstacles**.
+
+**Model.**
+
+- **Grid.** 4-connected. Each step an agent moves to a neighbouring cell or
+  waits; both cost one time step.
+- **Conflicts.** Two agents may not occupy the same cell at the same time
+  (*vertex* conflict) or swap cells in one step (*swap* conflict). Following
+  directly behind another agent is allowed: repairs are computed before agents
+  move, so a breakdown can never cause a rear-end collision.
+- **Layout.** A Kiva-style warehouse, 21 × 33 for the main experiments. It has
+  rows of shelves with 1-wide aisles and cross-aisles, and a corridor ringing
+  the shelf area. Pickup points are aisle cells next to a shelf.
+- **Docks and stations.** Docks are dead-end cells on the top and bottom
+  edges, one private dock per robot: no other robot may enter it. Delivery
+  stations are dead-end cells on the left and right edges, shared by all.
+  Robots park only in docks, so a parked robot never blocks anyone. Ma et al.
+  (2017) call such a layout *well-formed*.
+- **Mission.** Each robot follows dock → p₁ → d₁ → … → pₘ → dₘ → dock, with m = 3
+  objects carried one at a time. Each robot orders its own tasks optimally by
+  trying all m! orders on static distances.
+- **Completion and metrics.** An agent's completion time Cᵢ is when it is back
+  at its dock with every delivery made. **Total time = SOC = Σ Cᵢ** (sum of
+  costs); the makespan, max Cᵢ, is also reported.
+- **Knowledge.** Committed plans are posted on a shared space-time
+  *reservation board* that any agent can read, as in a warehouse
+  traffic-management system. A disruption is announced when it happens,
+  together with its duration. Nobody knows about future disruptions. Asking
+  another agent to change its plan takes messages.
+
+## 2. Initial planning: prioritized multi-goal Space-Time A*
+
+**Low-level search.** One multi-goal Space-Time A* does every search in the
+system.
+
+- **State:** (cell, time, index of next goal).
+- **Heuristic:** the exact static distance through all remaining goals, from
+  cached BFS maps.
+- **Hard constraints:** walls, other agents' docks, blocked-cell windows,
+  frozen (broken-down) agents, CBS constraints, an optional deadline on one
+  goal, and the reservation-board entries of agents classed as *hard*.
+- **Soft constraints:** entries of agents classed as *soft* may be crossed, but
+  each crossing counts as a conflict.
+- **Result:** the cheapest path and, among the cheapest, the one with fewest
+  soft conflicts. This ordering is exact because every path to a state has the
+  same cost, so the priority (f, soft) is consistent.
+- **Termination:** after the last time any dynamic constraint exists the world
+  is static, so the search finishes with the exact static route.
+- **Budget:** searches are bounded by an expansion count, never by wall-clock
+  time.
+
+**Plan generation.** The plan generator is *prioritized planning* (Cooperative
+A*): agents are planned one at a time, longest tour first, each treating
+earlier plans as hard. A failed agent is moved to the front and planning
+restarts. In this layout it always succeeds at t = 0.
+
+## 3. Disruptions and how agents detect them
+
+Each disruption's directly affected agents -- the **forced** agents, whose plans
+it makes infeasible -- are found by each agent checking its own plan against
+the new world.
+
+| Disruption | Semantics | Forced agents |
+|---|---|---|
+| Blockage | Cell c is blocked for d ~ U[10,30] steps. Never placed on docks or stations, and never under a robot: the start is deferred until c is free. | Agents whose plan uses c during the window |
+| Breakdown | Robot b freezes for d ~ U[5,20] steps, then continues. While frozen, b is an obstacle, not a negotiator. | b, plus agents whose plan enters b's cell during the window |
+| Emergency | Robot e gets an urgent pickup → delivery placed first in its goal list, with deadline = earliest possible delivery + δ (δ = 0 by default) | e |
+
+**Obstacle density ρ** is the average fraction of blockable cells blocked at
+any moment: arrival rate × mean duration ÷ number of cells. Breakdowns
+average 0.3 per robot per episode, and there are 2 emergencies per episode.
+
+Each event type has its own random stream, so every strategy sees exactly the
+same disruptions.
+
+## 4. Repair: Keep/Release Conflict-Based Search (KR-CBS)
+
+### 4.1 Objective
+
+For each disruption, minimise in strict priority order:
+
+1. the number of agents whose plan (from now on) differs from their committed
+   plan;
+2. total time (SOC).
+
+The lower bound for (1) is the number of forced agents.
+
+### 4.2 The search
+
+A search node holds:
+
+- **R:** agents released to replan (initially the forced agents);
+- **K:** agents kept, whose committed plans are *hard* for everyone in R;
+- the CBS constraints;
+- a path for each agent in R.
+
+Every other agent is *undecided*: its committed plan is a *soft* obstacle, so
+low-level searches may cross it but prefer not to. Expanding a node takes its
+earliest conflict:
+
+- **Between two agents in R:** the ordinary CBS split (constrain one or the
+  other).
+- **Between i ∈ R and an undecided agent j:**
+  - **KEEP j:** j joins K, and agents of R that collided with j replan around
+    it.
+  - **RELEASE j:** j joins R and receives a REPLAN_REQUEST. It plans its own
+    new route and answers with a PROPOSAL.
+
+Nodes are expanded best-first by the key (|R|, SOC, soft conflicts).
+
+**Why the answer is the minimum.** Every possible repair either leaves j's plan
+untouched -- it lies under KEEP j -- or changes it -- it lies under RELEASE j. So
+the two children together contain every repair. Within one value of |R|,
+adding constraints or kept agents can only raise SOC. Nodes are therefore
+popped level by level, and the first conflict-free node has the fewest
+released agents and, among those, the least total time.
+
+A released agent that ends up with its old plan would mean the same repair
+exists one level lower, where it would already have been found. So "released"
+equals "changed" at the optimum. The result is optimal *per repair*; it cannot
+anticipate future disruptions.
+
+**Engineering details.**
+
+- *Fast path:* first try "only the forced agents replan, everyone else
+  fixed". This is plain CBS over the forced agents, it is the commonest case,
+  and it is exact for that level.
+- *Conflict-avoidance table:* each low-level search counts collisions with the
+  other released agents' current paths as soft conflicts. This steers ties
+  away from needless internal conflicts without changing any cost.
+- *Budgets:* 1,500 high-level nodes per stage. If the exact stage runs out, a
+  **greedy** stage orders nodes by |R| + (number of distinct undecided agents
+  still hit). Its answers are flagged as not exact.
+- *Infeasible deadline:* if an emergency deadline has become impossible -- for
+  example because the robot carrying it broke down -- KR-CBS repairs again
+  with the deadline relaxed, and records that it did.
+
+### 4.3 Negotiation protocol
+
+The forced agent whose plan breaks soonest leads the session. Messages are:
+
+- **REPLAN_REQUEST** (leader → j): constraints, plus the set of kept agents;
+- **PROPOSAL / CANNOT_COMPLY** (j → leader);
+- **COMMIT** (to every agent whose plan changes) and **RELEASE** (to agents
+  consulted but left unchanged).
+
+An agent plans only its own route, so its task list stays private. The
+"neighbours" an agent negotiates with are exactly the agents whose committed
+trajectories conflict with a proposed path. The group grows only through such
+conflicts. Every strategy's searches go through the same session object, so
+message counts are comparable.
+
+### 4.4 Escalation -- never inventing a plan
+
+If KR-CBS cannot repair within budget, the escalation chain is:
+
+1. prioritized replanning of every agent within radius 4, then 8, then 16 of
+   the disruption;
+2. a global replan;
+3. the same with deadlines relaxed;
+4. if the fleet is gridlocked, a **global pause**: every active agent stands
+   still for d steps (d = 2, 4, …, 64) and the fleet is replanned from there.
+   Standing still is always physically safe, and obstacle windows expire
+   during the pause.
+
+Every escalation is recorded. A repair that still fails ends the episode as a
+failure; it is never covered with a fabricated plan. After every commit an
+independent checker, sharing no code with the planner, replays all plans
+looking for collisions, illegal moves, entries into blocked cells or others'
+docks, and missed goals.
+
+## 5. Strategies compared
+
+All strategies are compared on identical instances, initial plans and
+disruptions.
+
+| Strategy | Who replans | Role |
+|---|---|---|
+| **Global** | everyone, prioritized planning from the current state | the reference the assignment forbids |
+| **Local** | forced agents only, one after another, everyone else fixed; on failure, global | repair with no negotiation |
+| **Cascade** | forced agents take priority; anyone they collide with replans around them, recursively | naive "get out of my way" negotiation |
+| **KR-CBS** | the smallest possible set of agents, found exactly | proposed |
+
+## 6. Experiments
+
+| | What varies | Answers |
+|---|---|---|
+| **E1** | One disruption is injected into a running plan, chosen so it is sure to hit someone. Fleet size N ∈ {10, 20, 30, 40, 50} × the 3 types × 100 samples. Every strategy repairs the *identical* state. | Agents changed per single disruption |
+| **E2a** | Full episodes, N ∈ {10, …, 50}, ρ = 2%, 20 seeds | Total time; scaling with N |
+| **E2b** | Full episodes, ρ ∈ {0, 1, 2, 4, 8}%, N = 30, 20 seeds | Total time; scaling with density |
+| **E3** | Emergency slack δ ∈ {0, 2, 5, 10, ∞}, N = 30, 100 samples | Agents changed vs emergency lateness |
+| **E4** | KR-CBS against a brute-force oracle on the small map, N ∈ {4, 6, 8}. The oracle tries every coalition, smallest first, and solves each optimally. | Is KR-CBS really minimal? |
+
+Means are reported with 95% bootstrap confidence intervals.
+
+Every episode in E2a and E2b -- 800 episodes, 4 strategies -- completed every
+task, and the independent checker found no violation in any repair. Full
+tables are in [results/summary.md](../results/summary.md).
 
 ## 7. Results
 
-2048 runs, twelve seeds per configuration. **No joint plan in any run contains a
-collision**, for any strategy, at any fleet size or obstacle density.
+### 7.1 Agents changed to handle a single disruption (E1)
 
-Read §6.1 first: "agents changed" is reported beside task completion throughout,
-because on its own it rewards giving up.
+There were 1,429 disruptions, each repaired by all four strategies from the
+identical state. "Forced" is the lower bound: these agents' plans were broken
+by the disruption itself.
 
-### 7.1 The headline comparison
+| Disruption | Forced | **KR-CBS** | Local | Cascade | Global |
+|---|---|---|---|---|---|
+| Blockage | 1.86 | **1.87** [1.77, 1.98] | 2.07 | 16.54 | 17.38 |
+| Breakdown | 1.99 | **2.13** [1.98, 2.30] | 2.29 | 17.08 | 17.14 |
+| Emergency (δ = 0) | 1.00 | **5.44** [4.58, 6.35] | 16.63 | 16.79 | 19.65 |
+| All | 1.60 | **3.21** [2.92, 3.55] | 7.24 | 16.82 | 18.09 |
 
-Averaged over every disrupted run:
+![Agents changed per disruption](../figures/fig3_impact.png)
 
-| strategy | total time steps | agents replanned per disruption | tasks done | repair time | agents abandoned/run |
-| --- | --- | --- | --- | --- | --- |
-| selfish | 16909 ± 1040 | 5.48 ± 0.30 | 72.6% | 43.2 ms | 7.59 |
-| greedy PGP | 16990 ± 1061 | 5.50 ± 0.33 | 69.1% | 9.3 ms | 7.61 |
-| ADOPT | 16947 ± 1062 | 5.38 ± 0.33 | 68.5% | 6.9 ms | 7.08 |
-| **CBS** | 17366 ± 1064 | **3.80 ± 0.22** | 69.7% | 122.8 ms | **1.10** |
-| full replan | 15432 ± 966 | 18.88 ± 1.76 | 81.5% | 1876.4 ms | 0.00 |
+- **Blockages and breakdowns.** KR-CBS is essentially at the floor: an
+  average of 0.02 extra agents for a blockage. Local repair matches it when
+  the forced agents can simply route around everyone else. When they cannot,
+  Local has no way to negotiate and falls back to a global replan.
+- **Emergencies are the real test.** A zero-slack emergency must take its
+  fastest route, so other agents *must* make way. KR-CBS finds the few that
+  have to move: 5.4 agents changed, versus 16–20 for every alternative.
+- **Exactness.** KR-CBS proved its answer minimal in 99.5% of blockages, 97.2%
+  of breakdowns and 74.2% of emergencies. The rest came from the greedy stage
+  or the escalation chain and are flagged.
 
-Against the syllabus strategies, CBS alters **29% fewer plans per disruption**
-than the DCOP while completing slightly more work, and abandons **six times
-fewer** agents. Against replanning the whole fleet it alters **80% fewer** plans
-and decides **15× faster**, for 12% more total time steps and 12 points of task
-completion.
+![Scaling with fleet size](../figures/fig1_scaling_agents.png)
 
-The four candidate-set strategies are almost indistinguishable from one another
-— 5.38 to 5.50 agents changed, within each other's confidence intervals. Whether
-the negotiation hill-climbs or solves the DCOP optimally barely matters. What
-matters is the size of the space being searched, which is the one thing they
-have in common and the one thing CBS changes.
+As the fleet grows from 10 to 50 robots, KR-CBS changes 1.34 → 6.27 agents
+per disruption (forced: 1.19 → 2.00). Global changes 3.4 → 37.5, Cascade
+2.3 → 34.7, and Local 1.7 → 14.5. Global and Cascade grow with the fleet
+itself. KR-CBS grows only with the local congestion around the disruption.
 
-### 7.2 Scaling with fleet size
+**What the minimum costs in time.** The mean increase in total time per
+disruption was 29.3 steps for KR-CBS, 29.2 for Local and 26.7 for Global.
+Cascade had 15.7, because it gives the disrupted agent right of way and makes
+everyone else absorb the delay -- changing 17 agents to do it.
 
-**Agents replanned per disruption:**
+### 7.2 Total time steps and scaling with the number of agents (E2a)
 
-| agents | selfish | greedy PGP | ADOPT | CBS | full replan |
-| --- | --- | --- | --- | --- | --- |
-| 10 | 2.22 | 2.05 | 1.99 | **1.49** | 2.72 |
-| 20 | 3.22 | 3.17 | 3.05 | **2.09** | 6.19 |
-| 30 | 4.74 | 4.78 | 4.63 | **3.24** | 11.03 |
-| 40 | 5.83 | 5.91 | 5.74 | **4.11** | 17.72 |
-| 60 | 7.63 | 7.62 | 7.62 | **5.38** | 30.74 |
-| 80 | 9.27 | 9.46 | 9.26 | **6.50** | 44.86 |
+Full episodes at ρ = 2%; mean of 20 seeds, 95% CI.
 
-Full replanning alters a number of agents that grows *linearly* with the fleet —
-2.7 at ten agents, 44.9 at eighty, which is 56% of everyone. Local repair grows
-roughly with the square root. CBS is the best at every fleet size and its margin
-widens: 25% better than ADOPT at ten agents, 30% at eighty, and **86% better
-than replanning** at eighty.
+| Agents | Undisrupted SOC | KR-CBS SOC | Local | Cascade | Global | Changed/repair: **KR-CBS** / Local / Cascade / Global (forced) |
+|---|---|---|---|---|---|---|
+| 10 | 1,393 | 1,582 | 1,584 | 1,570 | 1,579 | **1.28** / 1.47 / 2.16 / 2.58 (1.23) |
+| 20 | 2,824 | 3,151 | 3,153 | 3,138 | 3,136 | **1.61** / 2.45 / 6.80 / 5.42 (1.52) |
+| 30 | 4,241 | 4,752 | 4,757 | 4,718 | 4,737 | **2.13** / 3.27 / 13.82 / 9.64 (1.84) |
+| 40 | 5,827 | 6,599 | 6,589 | 6,571 | 6,541 | **2.51** / 4.09 / 23.29 / 16.01 (2.10) |
+| 50 | 7,457 | 8,526 | 8,465 | 8,566 | 8,469 | **3.40** / 5.50 / 31.83 / 24.11 (2.44) |
 
-**Repair time per disruption (ms):**
+![Total time vs fleet size](../figures/fig4_total_time_agents.png)
 
-| agents | greedy PGP | ADOPT | CBS | full replan |
-| --- | --- | --- | --- | --- |
-| 10 | 2.1 | 3.2 | 22.2 | 58.3 |
-| 20 | 3.7 | 4.6 | 42.1 | 284.3 |
-| 40 | 9.2 | 7.4 | 104.4 | 1431.1 |
-| 60 | 13.7 | 9.0 | 200.6 | 2391.3 |
-| 80 | 19.8 | **10.1** | 283.6 | **6357.0** |
+- **Total time is statistically the same for all four strategies** at every
+  fleet size; the confidence intervals overlap, as plotted. Disruptions add
+  about 12–14% to the undisrupted total, and the choice of repair strategy
+  hardly changes that.
+- **What does differ is how much of the fleet is disturbed.** At 50 agents a
+  repair by Global rewrites 24 plans and one by Cascade 32. KR-CBS rewrites
+  3.4, against an unavoidable 2.44.
+- **Robustness.** Over the episodes, KR-CBS fell back to escalation in 0.2–5%
+  of repairs. Local fell back in 5–7% (each time to a global replan), and
+  Cascade in up to 43%.
 
-ADOPT's repair time is very nearly flat in fleet size (3.2 ms to 10.1 ms) because
-its work is bounded by `k_max`, not by the fleet. CBS is bounded the same way but
-its constant is far larger — every node of its constraint tree costs a full
-multi-leg replan — so it lands between the DCOP and full replanning, roughly 28×
-the former and 22× cheaper than the latter. Full replanning reaches 6.4 seconds
-per disruption at eighty agents, which on a floor where disruptions arrive every
-few seconds is no longer a repair strategy at all.
+### 7.3 Scaling with the density of dynamic obstacles (E2b)
 
-### 7.3 Scaling with obstacle density
+30 agents; ρ is the share of blockable cells blocked at an average moment.
+The realised averages were up to 6.5%.
 
-**Agents replanned per disruption:**
+| ρ | Repairs/episode | KR-CBS SOC | Local | Cascade | Global | Changed/repair: **KR-CBS** / Local / Cascade / Global (forced) |
+|---|---|---|---|---|---|---|
+| 0% | 10 | 4,512 | 4,495 | 4,448 | 4,486 | **2.73** / 6.66 / 16.29 / 14.74 (1.76) |
+| 1% | 29 | 4,645 | 4,638 | 4,601 | 4,591 | **2.21** / 3.89 / 14.62 / 10.18 (1.84) |
+| 2% | 49 | 4,752 | 4,757 | 4,718 | 4,737 | **2.13** / 3.27 / 13.82 / 9.64 (1.84) |
+| 4% | 90 | 4,994 | 4,994 | 5,001 | 5,019 | **1.96** / 2.76 / 13.64 / 9.04 (1.82) |
+| 8% | 174 | **5,556** | 5,628 | 5,690 | 5,697 | **1.95** / 2.93 / 14.10 / 9.81 (1.84) |
 
-| density | selfish | greedy PGP | ADOPT | CBS | full replan |
-| --- | --- | --- | --- | --- | --- |
-| 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| 0.01 | 5.52 | 5.38 | 5.31 | **3.97** | 20.90 |
-| 0.02 | 5.46 | 5.53 | 5.36 | **3.92** | 18.89 |
-| 0.03 | 5.44 | 5.51 | 5.40 | **3.69** | 18.29 |
-| 0.04 | 5.50 | 5.57 | 5.46 | **3.64** | 17.41 |
+![Agents changed vs density](../figures/fig2_scaling_density.png)
+![Total time vs density](../figures/fig5_total_time_density.png)
 
-Impact per disruption is **flat** in density for every strategy — quadrupling the
-obstacle density leaves it essentially unchanged. Density determines *how many*
-disruptions occur, not how far each one propagates: the blast radius is set by
-the local structure of the floor and by `k_max`, neither of which depends on how
-damaged the rest of the warehouse is. This is the cleanest result in the study
-and it holds across all five strategies.
+- **Density mainly multiplies the *number* of repairs**, from 10 to 174 per
+  episode. Total time rises from +6% to +31–34% over the undisrupted plan.
+- **The cost of each repair stays flat for KR-CBS.** About 2 agents per
+  repair, against an unavoidable ~1.8, at every density.
+- **At ρ = 0 only breakdowns and emergencies happen.** That is why
+  changed/repair is highest there for every strategy: emergencies dominate.
+- **At the highest density KR-CBS has the lowest total time**: 5,556 against
+  5,697 for Global. When repairs are frequent, rewriting many plans each time
+  keeps creating new conflicts with the next disruption. Leaving undisturbed
+  plans alone is better for throughput, not just for stability.
 
-CBS's figure drifts slightly *downward* as the floor degrades (3.97 to 3.64),
-which is not noise in the expected direction: on a more blocked floor there are
-fewer legal alternatives, so the constraint tree closes sooner and fewer agents
-end up constrained.
+### 7.4 Emergency deadline slack (E3)
 
-Total cost roughly doubles from the undisrupted baseline (10543 steps) to 4%
-density (about 21000), and full replanning's repair time more than triples
-(911 ms to 3273 ms) as each replan runs on a more congested floor. CBS's repair
-time rises only 30% (111 ms to 145 ms), and ADOPT's 23%.
+| Slack δ | KR-CBS: changed / lateness | Local: changed / lateness | Global: changed |
+|---|---|---|---|
+| 0 | 4.16 / 0.0 | 15.54 / 0.0 | 19.16 |
+| 2 | 2.59 / 0.9 | 11.49 / 0.4 | 19.16 |
+| 5 | 1.63 / 2.2 | 6.31 / 1.4 | 19.16 |
+| 10 | 1.06 / 3.3 | 2.07 / 3.0 | 19.16 |
+| ∞ | 1.00 / 3.8 | 1.00 / 3.8 | 19.16 |
 
-### 7.4 Why CBS wins: completeness, not cleverness
+![Emergency slack trade-off](../figures/fig6_emergency_slack.png)
 
-| strategy | repair failures/run | agents abandoned/run | safety-net trims/run |
-| --- | --- | --- | --- |
-| selfish | 4.24 | 7.59 | 0.04 |
-| greedy PGP | 4.15 | 7.61 | 2.94 |
-| ADOPT | 3.81 | 7.08 | 3.08 |
-| **CBS** | **0.53** | **1.10** | **0.69** |
-| full replan | 23.51 | 0.00 | 0.00 |
+The deadline turns "how urgent is it?" into an explicit dial. Letting an
+emergency arrive 2 steps later than physically possible cuts the disturbance
+from 4.2 to 2.6 agents; 10 steps of slack disturbs no one else. At every δ,
+KR-CBS meets the deadline while disturbing the fewest agents.
 
-This is the mechanism behind every other CBS number. The candidate-set strategies
-fail to find a repair about four times per run and abandon roughly seven agents'
-tasks; CBS fails half a time and abandons one. Searching the actual plan space
-rather than five samples of it means an agent rarely has to give up — and an
-agent that keeps working keeps a plan that can be repaired later, rather than
-becoming a permanent obstacle that forces *other* agents to replan.
+### 7.5 Is KR-CBS really minimal? (E4)
 
-That also explains why CBS changes fewer plans while completing more work: the
-two are not in tension, they have a common cause.
+On the small map, 201 disruptions were checked against the brute-force oracle.
 
-`full_replan`'s 23.51 "failures" are a different thing — individual agents its
-prioritized ordering could not place on a given attempt, which the restart
-mechanism then resolves. It abandons nobody, which is what the whole-fleet
-replan buys.
+| Agents | Disruptions | Proven exact | Changed = true minimum | SOC = true minimum |
+|---|---|---|---|---|
+| 4 | 68 | 68 | 68/68 | 68/68 |
+| 6 | 66 | 66 | 66/66 | 66/66 |
+| 8 | 67 | 64 | 64/64 | 64/64 |
 
-### 7.5 The `beta` knob
+Whenever KR-CBS finished within its budget, its repair was exactly minimal in
+both the number of agents changed and total time. In the 3 cases where it ran
+out of budget, the greedy stage overshot the minimum by 1.7 agents on average.
 
-| beta | agents changed | total steps |
-| --- | --- | --- |
-| 0 | 4.96 | 13490 |
-| 1 | 4.81 | 13644 |
-| 4 | 4.57 | 13674 |
-| 10 | 4.45 | 13756 |
-| 60 | 4.46 | 13779 |
+### 7.6 Cost
 
-Raising the penalty for altering a plan reduces churn by 10% for about 2% more
-total time steps, then saturates past `beta = 10` — what remains are agents that
-genuinely cannot keep their plans. Note the scale: the entire useful range of
-this knob (0.5 agents) is smaller than the gap CBS opens by changing the search
-(1.6 agents). Tuning the objective is worth less than fixing what it is
-optimising over.
+KR-CBS is the most expensive strategy to compute. At 50 agents a repair takes
+about 2.6 s on average, against 1.7 s for Global and 0.2 s for Local. Most
+repairs take the fast path ("only the forced agents change") and finish in a
+fraction of a second. The cost is concentrated in emergencies, where the
+search must prove that fewer releases are impossible.
 
-### 7.6 PGP's dampening threshold
+The same holds for negotiation: an average of 829 messages per disruption,
+1,972 for emergencies. Every request the leader sends while exploring an
+option counts, including options it then rejects.
 
-| tau | changes broadcast | changes actually made | total steps |
-| --- | --- | --- | --- |
-| 0 | 4.44 | 4.57 | 13674 |
-| 2 | 3.92 | 4.57 | 13674 |
-| 5 | 3.61 | 4.57 | 13674 |
-| 10 | 3.58 | 4.57 | 13674 |
+![Compute per repair](../figures/fig7_runtime.png)
 
-Exactly what PGP's mechanism 6 predicts: slack cuts coordination traffic without
-touching the plans. At `tau = 5`, 19% of changes are absorbed silently and the
-total cost is *identical*. Beyond `tau = 10` it flattens — what remains are
-changes too large to hide.
+![A KR-CBS repair](../figures/fig8_repair_example.png)
 
-### 7.7 The neighbourhood cap
+## 8. Discussion and limitations
 
-| k_max | agents changed | total steps | repair ms |
-| --- | --- | --- | --- |
-| 2 | 4.18 | 13894 | 1.4 |
-| 4 | 4.38 | 13604 | 3.0 |
-| 6 | 4.57 | 13674 | 6.8 |
-| 8 | 4.87 | 13907 | 13.3 |
-| 10 | 5.02 | 13330 | 33.9 |
+- **Why a search over real paths, not a DCOP over candidate paths.** The
+  textbook's plan-combination view casts coordination as each agent choosing
+  among candidate plans -- a DCOP that ADOPT could solve. Doing that requires
+  precomputing a few candidates per agent, and the candidates then cap the
+  answer. An earlier attempt at this assignment found greedy, ADOPT and
+  no-negotiation all tied, because all three chose from the same few
+  candidates. KR-CBS keeps the plan-combination idea -- a search over which
+  agents keep and which modify their plans (plan modification, Weiss Ch 11)
+  -- but generates each candidate on demand with a full space-time search.
+  That is what makes the minimum both reachable and checkable.
+- **Optimal per repair, not per episode.** Future disruptions are unknown;
+  E2b suggests that minimal change is also good for throughput when
+  disruptions are frequent.
+- **Assumptions.**
+  - Execution is exact (no random delays).
+  - Disruption durations are announced.
+  - Plans are shared through a common reservation board; only *changing*
+    another agent's plan needs negotiation.
+  - Following another agent closely is allowed.
+- **Budgets.** Exactness is guaranteed only within the node budget. 10% of E1
+  repairs, mostly emergencies, used the greedy stage or escalation instead,
+  and are reported as such rather than as optimal.
+- **Gridlock.** In the densest settings prioritized replanning can gridlock.
+  The global pause recovers, but every agent then counts as changed.
 
-A wider huddle disturbs more agents and costs sharply more to solve — repair time
-rises 24× from `k_max = 2` to `10`, which is the exponential in ADOPT showing
-through — while total time steps barely move. Little to gain past six on this
-floor.
+## References
 
-### 7.8 ADOPT's error bound
-
-| b | repair ms | cycles | messages |
-| --- | --- | --- | --- |
-| 0 | 7.1 | 10.7 | 202 |
-| 10 | 5.9 | 7.8 | 163 |
-| 50 | 5.7 | 7.0 | 148 |
-
-Bounded-error approximation buys about 20% in time and 27% in messages. Modest
-here because the neighbourhoods are small; the mechanism matters more at larger
-`k_max`, where the exponential binds.
-
-### 7.9 Social laws
-
-One-way aisles made things **worse** for every strategy — 2.7% to 4.7% more total
-time steps. On single-width aisles with a two-wide perimeter, the convention
-removes head-on conflicts that prioritized planning already resolved cheaply, and
-in exchange forces a detour on every agent travelling against the flow. Reported
-because it is a genuine negative result: a social law pays only when the
-coordination it saves exceeds the flexibility it removes, and here it does not.
-
----
-
-## 8. Conclusions
-
-The assignment's three questions, answered directly.
-
-**Total time steps.** Local negotiated repair costs 10–12% more than replanning
-the whole fleet after every disruption (16947 for ADOPT, 17366 for CBS, against
-15432). Replanning globally produces better schedules; the comparison measures
-what locality costs, not planning quality.
-
-**Agents altered per disruption.** 3.80 for CBS and 5.38 for ADOPT, against 18.88
-for full replanning — 5.0× and 3.5× fewer. At eighty agents the gap is widest:
-6.50 and 9.26 against 44.86, so local repair touches a seventh of what a global
-replan does. This holds because the neighbourhood is bounded by `k_max` rather
-than by the fleet.
-
-**Scaling.** The two axes behave differently, which was the most informative
-finding. In **fleet size** the approaches diverge: full replanning's impact and
-cost grow with the number of agents, while local repair's impact grows
-sub-linearly and its decision time stays bounded. In **obstacle density**, impact
-per disruption is flat for every strategy — density changes how often repair is
-needed, not how far it reaches.
-
-**What going outside the syllabus was worth.** The four syllabus strategies sit
-within each other's error bars on every headline metric (5.38 to 5.50 agents
-changed). Whether agents hill-climb or solve the DCOP optimally is nearly
-irrelevant, because they are all choosing among the same five precomputed plans.
-Replacing that with a search over the real plan space — CBS — cut churn by 29%,
-cut abandonment six-fold, and slightly improved completion. The lesson is that
-the binding constraint was the *formulation*, not the solver: ADOPT was solving
-the given problem optimally, and the given problem was the wrong one.
-
-That is not a criticism of the taught material. Ch 12's insistence that an agent
-controls only its own variable is what makes the DCOP genuinely distributed, and
-CBS gives that up — it is a centralised search over the neighbourhood. The
-comparison is really between a distributed algorithm with a restricted view and a
-centralised one with a complete view, and on these instances the complete view
-wins by more than optimality does.
-
-**Limitations.** CBS costs 18× ADOPT's compute and is not distributed. Local
-repair of any kind still completes less work than global replanning (69–73%
-against 82%) and strands more agents. `k_max` is fixed ahead of time rather than
-adapted to congestion, with only a single escalation step. The disruption model
-is permanent — nothing is ever cleared — which is the pessimistic case. And both
-complete solvers have exponential worst cases that are visible in the data:
-ADOPT's in the `k_max` sweep, CBS's in the search budget it has to be given.
+- E. Durfee, S. Zilberstein. *Multiagent Planning, Control, and Execution.*
+  In G. Weiss (ed.), *Multiagent Systems*, 2nd ed., MIT Press, 2013, ch. 11.
+- G. Sharon, R. Stern, A. Felner, N. Sturtevant. Conflict-based search for
+  optimal multi-agent pathfinding. *Artificial Intelligence* 219, 2015.
+- D. Silver. Cooperative pathfinding. *AIIDE*, 2005.
+- H. Ma, J. Li, T. K. S. Kumar, S. Koenig. Lifelong multi-agent path finding
+  for online pickup and delivery tasks. *AAMAS*, 2017.
+- M. Fox, A. Gerevini, D. Long, I. Serina. Plan stability: replanning versus
+  plan repair. *ICAPS*, 2006.

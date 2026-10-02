@@ -1,19 +1,14 @@
-"""Automated warehouse multiagent pathfinding with PGP/DCOP plan repair.
+"""Automated warehouse multi-agent path finding with minimum-change plan repair.
 
-Implements the system described in the assignment: a fleet of robots plans
-collision-free pickup/delivery routes with prioritized Space-Time A*, then
-repairs those plans locally when the environment disrupts them, negotiating
-with neighbouring agents rather than replanning globally.
+A fleet of robots plans collision-free pickup-and-delivery routes with
+prioritized multi-goal Space-Time A* (:mod:`warehouse.planner`).  During
+execution, blockages, breakdowns and emergency tasks invalidate some plans; the
+affected agents negotiate a repair (:mod:`warehouse.negotiation`) found by
+Keep/Release CBS (:mod:`warehouse.repair.cbs`), which changes as few agents'
+plans as possible and, among those repairs, minimises total time.
 
-The design follows Weiss, *Multiagent Systems* (2nd ed.):
-
-* Ch 11 section 3   -- coordination prior to local planning (social laws,
-                       organizational structuring, contract net)
-* Ch 11 section 4   -- local planning prior to coordination (MPCP)
-* Ch 11 section 6.3 -- partial global planning (PGP) and its six mechanisms,
-                       which structure the repair layer
-* Ch 12             -- DCOP formulation and the ADOPT solver, which decides
-                       *which* agents change their plans
+The ``dcop`` subpackage (ADOPT) is course material kept for reference; the
+repair system does not use it.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

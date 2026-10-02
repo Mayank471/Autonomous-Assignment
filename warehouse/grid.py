@@ -1,299 +1,237 @@
-"""Warehouse floor: a 2D grid of cells with shelves, aisles and stations.
+"""Warehouse floor: a 4-connected grid with shelves, aisles, docks and stations.
 
-Cells are addressed by integer id (``r * n_cols + c``) rather than ``(r, c)``
-tuples.  The planner touches millions of cells across the experiment sweep and
-integer keys keep the Space-Time A* inner loop cheap; :meth:`WarehouseGrid.rc`
-and :meth:`WarehouseGrid.cell` convert when readability matters.
+Cells are plain ints, ``cell = row * width + col``, so they can be used as dict
+keys and packed into larger integer keys cheaply.
 
-A ``WarehouseGrid`` is immutable once built, so one instance is safely shared
-across every run that uses the same layout.  Dynamic obstacles live separately
-in :class:`~warehouse.disruptions.DynamicObstacles`.
+Layout produced by :func:`make_warehouse` (``main`` preset shown schematically)::
+
+    row 0      D D D D D D D D D D D      docks: private dead-end pockets
+    row 1    . . . . . . . . . . . . .    ring corridor
+    row 2  S . . p p p p . p p p p . . S  aisle (p = pickup point next to a shelf)
+    row 3  # . . # # # # . # # # # . . #  shelf row, broken by cross-aisles
+    ...
+    row H-2  . . . . . . . . . . . . .    ring corridor
+    row H-1    D D D D D D D D D D D      docks
+
+``S`` cells are delivery stations: dead-end pockets on the left and right edges,
+shared by every agent.  ``D`` cells are docks: each agent owns one and no other
+agent may ever enter it.  Robots only park in docks, so a parked robot never
+blocks anyone -- the layout is *well-formed* in the sense of Ma et al. (2017),
+which is what lets prioritized planning always find a solution.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, Sequence
 
-import numpy as np
-
-# Movement deltas in (row, col).  Order matters only for tie-breaking.
-_DELTAS = ((-1, 0), (1, 0), (0, -1), (0, 1))
-
-#: Directions usable as a social-law annotation (see :mod:`warehouse.sociallaws`).
-NORTH, SOUTH, WEST, EAST = _DELTAS
+UNREACHABLE = 1 << 30
 
 
-@dataclass(frozen=True)
+@dataclass
 class WarehouseGrid:
-    """A static warehouse floor plan.
-
-    Attributes:
-        n_rows, n_cols: floor dimensions in cells.
-        passable: boolean array, ``True`` where a robot may stand.
-        pickup_points: cell ids where objects can be collected (aisle cells
-            adjacent to a shelf block).
-        delivery_points: cell ids of the workstations objects are carried to.
-        dock_points: cell ids of the docking bays agents start and finish on.
-        zone_shape: ``(zone_rows, zone_cols)`` size of one organizational zone.
-    """
-
-    n_rows: int
-    n_cols: int
-    passable: np.ndarray
-    pickup_points: tuple[int, ...]
-    delivery_points: tuple[int, ...]
-    dock_points: tuple[int, ...] = ()
-    zone_shape: tuple[int, int] = (5, 6)
-
-    # Derived, filled in __post_init__.  Excluded from eq/repr.
-    _neighbors: tuple[tuple[int, ...], ...] = field(
-        default=(), repr=False, compare=False
-    )
-    _free_cells: tuple[int, ...] = field(default=(), repr=False, compare=False)
-    _zone_of: tuple[int, ...] = field(default=(), repr=False, compare=False)
+    width: int
+    height: int
+    free: list[bool]
+    docks: list[int]
+    stations: list[int]
+    pickups: list[int]
+    name: str = "custom"
+    neighbors: list[tuple[int, ...]] = field(init=False, repr=False)
+    dock_set: frozenset[int] = field(init=False, repr=False)
+    station_set: frozenset[int] = field(init=False, repr=False)
+    blockable: list[int] = field(init=False, repr=False)
+    _dist_cache: dict[int, list[int]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "_neighbors", self._build_neighbors())
-        object.__setattr__(
-            self,
-            "_free_cells",
-            tuple(int(i) for i in np.flatnonzero(self.passable.ravel())),
-        )
-        object.__setattr__(self, "_zone_of", self._build_zones())
+        w, h = self.width, self.height
+        self.dock_set = frozenset(self.docks)
+        self.station_set = frozenset(self.stations)
+        pockets = self.dock_set | self.station_set
+        nbrs: list[tuple[int, ...]] = []
+        for cell in range(w * h):
+            if not self.free[cell]:
+                nbrs.append(())
+                continue
+            r, c = divmod(cell, w)
+            out = []
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < h and 0 <= cc < w and self.free[rr * w + cc]:
+                    # Pockets (docks, stations) connect only to ordinary cells,
+                    # never to each other, so they are true dead ends even
+                    # when laid out side by side.
+                    if cell in pockets and rr * w + cc in pockets:
+                        continue
+                    out.append(rr * w + cc)
+            nbrs.append(tuple(out))
+        self.neighbors = nbrs
+        # Cells a sudden blockage may land on: anything traversable except the
+        # pockets (docks and stations).
+        self.blockable = [
+            c for c in range(w * h)
+            if self.free[c] and c not in self.dock_set and c not in self.station_set
+        ]
 
-    # ---------------------------------------------------------------- indexing
-
-    def cell(self, r: int, c: int) -> int:
-        """Cell id for row ``r``, column ``c``."""
-        return r * self.n_cols + c
-
-    def rc(self, cell: int) -> tuple[int, int]:
-        """``(row, col)`` for a cell id."""
-        return divmod(cell, self.n_cols)
-
+    # ------------------------------------------------------------------ basics
     @property
     def n_cells(self) -> int:
-        return self.n_rows * self.n_cols
+        return self.width * self.height
 
-    @property
-    def free_cells(self) -> tuple[int, ...]:
-        """Every statically passable cell id."""
-        return self._free_cells
+    def rc(self, cell: int) -> tuple[int, int]:
+        return divmod(cell, self.width)
 
-    def is_free(self, cell: int) -> bool:
-        """Whether ``cell`` is statically passable (ignores dynamic obstacles)."""
-        r, c = self.rc(cell)
-        return bool(self.passable[r, c])
-
-    def neighbors(self, cell: int) -> tuple[int, ...]:
-        """Passable 4-connected neighbours of ``cell``, precomputed."""
-        return self._neighbors[cell]
+    def cell(self, row: int, col: int) -> int:
+        return row * self.width + col
 
     def manhattan(self, a: int, b: int) -> int:
-        ar, ac = self.rc(a)
-        br, bc = self.rc(b)
+        ar, ac = divmod(a, self.width)
+        br, bc = divmod(b, self.width)
         return abs(ar - br) + abs(ac - bc)
 
-    # ------------------------------------------------------------ organization
+    # ---------------------------------------------------------------- distances
+    def dist_from(self, target: int) -> list[int]:
+        """Exact static shortest-path distance from every cell to ``target``.
 
-    def zone_of(self, cell: int) -> int:
-        """Zone id containing ``cell`` (Ch 11 section 3.2 organizational structuring)."""
-        return self._zone_of[cell]
-
-    @property
-    def n_zones(self) -> int:
-        zr, zc = self.zone_shape
-        return ((self.n_rows + zr - 1) // zr) * ((self.n_cols + zc - 1) // zc)
-
-    # ------------------------------------------------------------ construction
-
-    def _build_neighbors(self) -> tuple[tuple[int, ...], ...]:
-        out: list[tuple[int, ...]] = []
-        for r in range(self.n_rows):
-            for c in range(self.n_cols):
-                if not self.passable[r, c]:
-                    out.append(())
-                    continue
-                adj = []
-                for dr, dc in _DELTAS:
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < self.n_rows and 0 <= nc < self.n_cols:
-                        if self.passable[nr, nc]:
-                            adj.append(nr * self.n_cols + nc)
-                out.append(tuple(adj))
-        return tuple(out)
-
-    def _build_zones(self) -> tuple[int, ...]:
-        zr, zc = self.zone_shape
-        per_row = (self.n_cols + zc - 1) // zc
-        return tuple(
-            (r // zr) * per_row + (c // zc)
-            for r in range(self.n_rows)
-            for c in range(self.n_cols)
-        )
-
-    # --------------------------------------------------------------- factories
-
-    @classmethod
-    def kiva(
-        cls,
-        n_rows: int = 50,
-        n_cols: int = 60,
-        shelf_h: int = 2,
-        shelf_w: int = 5,
-        aisle: int = 1,
-        highway: int = 2,
-        n_delivery: int = 12,
-        zone_shape: tuple[int, int] = (5, 6),
-    ) -> "WarehouseGrid":
-        """Build a Kiva-style warehouse: shelf blocks in a field of aisles.
-
-        A ``highway``-wide ring of open floor surrounds a field of
-        ``shelf_h x shelf_w`` shelf blocks separated by ``aisle``-wide gaps.
-
-        * **Pickup points** are the aisle cells touching a shelf.
-        * **Docking bays** are the outermost ring cells.  Agents start and
-          finish there, and a dock belongs to its agent for the whole run, so
-          it is a wall to everyone else.  Putting them on the outer wall means
-          that can never disconnect the floor: the *inner* highway row remains
-          open and still joins every aisle.
-        * **Delivery stations** sit on the inner highway ring, so they stay
-          traversable and never collide with a dock.
+        Docks and stations are dead-end pockets, so no shortest path ever passes
+        *through* one; plain BFS on the free cells is therefore exact even though
+        other agents' docks are forbidden during planning.
         """
-        passable = np.ones((n_rows, n_cols), dtype=bool)
+        d = self._dist_cache.get(target)
+        if d is not None:
+            return d
+        d = [UNREACHABLE] * self.n_cells
+        d[target] = 0
+        q = deque([target])
+        nbrs = self.neighbors
+        while q:
+            u = q.popleft()
+            du = d[u] + 1
+            for v in nbrs[u]:
+                if d[v] == UNREACHABLE:
+                    d[v] = du
+                    q.append(v)
+        self._dist_cache[target] = d
+        return d
 
-        top, left = highway, highway
-        bottom, right = n_rows - highway, n_cols - highway
-        r = top
-        while r + shelf_h <= bottom:
-            c = left
-            while c + shelf_w <= right:
-                passable[r : r + shelf_h, c : c + shelf_w] = False
-                c += shelf_w + aisle
-            r += shelf_h + aisle
+    def dist(self, a: int, b: int) -> int:
+        return self.dist_from(b)[a]
 
-        pickups = cls._aisle_cells_touching_shelves(passable, n_rows, n_cols)
+    def tour_length(self, start: int, goals: list[int] | tuple[int, ...]) -> int:
+        total, cur = 0, start
+        for g in goals:
+            total += self.dist(cur, g)
+            cur = g
+        return total
 
-        # Docking bays: the outermost ring.
-        docks: list[int] = []
-        for c in range(n_cols):
-            docks.append(c)
-            docks.append((n_rows - 1) * n_cols + c)
-        for r in range(1, n_rows - 1):
-            docks.append(r * n_cols)
-            docks.append(r * n_cols + n_cols - 1)
-        dock_set = set(docks)
-
-        # Delivery stations: evenly spaced along the inner highway ring.
-        deliveries: list[int] = []
-        inner_left, inner_right = 1, n_cols - 2
-        inner_top, inner_bottom = 1, n_rows - 2
-        half = max(1, n_delivery // 2)
-        for rr in np.linspace(inner_top + 1, inner_bottom - 1, half).astype(int):
-            deliveries.append(int(rr) * n_cols + inner_left)
-        for cc in np.linspace(inner_left + 1, inner_right - 1, n_delivery - half).astype(int):
-            deliveries.append(inner_bottom * n_cols + int(cc))
-
-        flat = passable.ravel()
-        seen: set[int] = set()
-        delivery_points: list[int] = []
-        for d in deliveries:
-            if d not in seen and d not in dock_set and flat[d]:
-                seen.add(d)
-                delivery_points.append(d)
-
-        return cls(
-            n_rows=n_rows,
-            n_cols=n_cols,
-            passable=passable,
-            pickup_points=tuple(c for c in pickups if c not in dock_set),
-            delivery_points=tuple(delivery_points),
-            dock_points=tuple(d for d in docks if flat[d]),
-            zone_shape=zone_shape,
-        )
-
-    @classmethod
-    def from_ascii(cls, art: str, zone_shape: tuple[int, int] = (5, 6)) -> "WarehouseGrid":
-        """Build a grid from ASCII art -- ``#`` shelf, ``p`` pickup, ``d`` delivery.
-
-        Used by the tests and the small demo scenarios, where a hand-drawn
-        layout is clearer than a generated one.
-        """
-        lines = [ln for ln in art.strip("\n").splitlines() if ln.strip()]
-        n_rows = len(lines)
-        n_cols = max(len(ln) for ln in lines)
-        passable = np.ones((n_rows, n_cols), dtype=bool)
-        pickups: list[int] = []
-        deliveries: list[int] = []
-        for r, line in enumerate(lines):
-            for c in range(n_cols):
-                ch = line[c] if c < len(line) else "."
-                if ch == "#":
-                    passable[r, c] = False
-                elif ch == "p":
-                    pickups.append(r * n_cols + c)
-                elif ch == "d":
-                    deliveries.append(r * n_cols + c)
-        return cls(
-            n_rows=n_rows,
-            n_cols=n_cols,
-            passable=passable,
-            pickup_points=tuple(pickups),
-            delivery_points=tuple(deliveries),
-            zone_shape=zone_shape,
-        )
-
-    @staticmethod
-    def _aisle_cells_touching_shelves(
-        passable: np.ndarray, n_rows: int, n_cols: int
-    ) -> list[int]:
-        """Free cells with at least one shelf neighbour -- the shelf access points."""
-        out: list[int] = []
-        for r in range(n_rows):
-            for c in range(n_cols):
-                if not passable[r, c]:
-                    continue
-                for dr, dc in _DELTAS:
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < n_rows and 0 <= nc < n_cols and not passable[nr, nc]:
-                        out.append(r * n_cols + c)
-                        break
-        return out
-
-    # ------------------------------------------------------------------ pretty
-
-    def render(
-        self,
-        occupied: dict[int, str] | None = None,
-        blocked: Iterable[int] = (),
-    ) -> str:
-        """Render the floor as text -- used by the terminal demo and for debugging."""
-        occupied = occupied or {}
-        blocked = set(blocked)
+    def render(self, marks: dict[int, str] | None = None) -> str:
+        marks = marks or {}
         rows = []
-        for r in range(self.n_rows):
-            chars = []
-            for c in range(self.n_cols):
-                cell = r * self.n_cols + c
-                if cell in occupied:
-                    chars.append(occupied[cell])
-                elif cell in blocked:
-                    chars.append("X")
-                elif not self.passable[r, c]:
-                    chars.append("#")
-                elif cell in self.delivery_points:
-                    chars.append("d")
+        for r in range(self.height):
+            line = []
+            for c in range(self.width):
+                cell = r * self.width + c
+                if cell in marks:
+                    line.append(marks[cell])
+                elif not self.free[cell]:
+                    line.append("#")
+                elif cell in self.dock_set:
+                    line.append("D")
+                elif cell in self.station_set:
+                    line.append("S")
                 else:
-                    chars.append(".")
-            rows.append("".join(chars))
+                    line.append(".")
+            rows.append("".join(line))
         return "\n".join(rows)
 
-    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
-        return (
-            f"WarehouseGrid({self.n_rows}x{self.n_cols}, "
-            f"free={len(self._free_cells)}, "
-            f"pickups={len(self.pickup_points)}, "
-            f"deliveries={len(self.delivery_points)}, "
-            f"zones={self.n_zones})"
-        )
+
+PRESETS = {
+    # n_blocks_x, block_len, n_shelf_rows
+    "small": (2, 4, 3),   # 11 x 15
+    "main": (4, 6, 8),    # 21 x 33
+}
+
+
+def make_warehouse(preset: str = "main", *, n_blocks_x: int | None = None,
+                   block_len: int | None = None, n_shelf_rows: int | None = None) -> WarehouseGrid:
+    """Build a Kiva-style warehouse (see module docstring)."""
+    bx, bl, nr = PRESETS[preset] if preset in PRESETS else (4, 6, 8)
+    bx = n_blocks_x or bx
+    bl = block_len or bl
+    nr = n_shelf_rows or nr
+
+    interior_w = bx * (bl + 1) + 1
+    interior_h = 2 * nr + 1
+    w = interior_w + 4
+    h = interior_h + 4
+    free = [False] * (w * h)
+
+    def setf(r: int, c: int) -> None:
+        free[r * w + c] = True
+
+    # ring corridor
+    for c in range(1, w - 1):
+        setf(1, c)
+        setf(h - 2, c)
+    for r in range(1, h - 1):
+        setf(r, 1)
+        setf(r, w - 2)
+    # interior: aisle rows everywhere, shelf rows only on cross-aisle columns
+    shelves: set[tuple[int, int]] = set()
+    for ir in range(interior_h):
+        r = ir + 2
+        for ic in range(interior_w):
+            c = ic + 2
+            is_shelf_row = ir % 2 == 1
+            is_cross = ic % (bl + 1) == 0
+            if is_shelf_row and not is_cross:
+                shelves.add((r, c))
+            else:
+                setf(r, c)
+    # docks on top/bottom rows, above/below the ring (excluding corners)
+    docks = []
+    for c in range(2, w - 2):
+        for r in (0, h - 1):
+            setf(r, c)
+            docks.append(r * w + c)
+    docks.sort()
+    # stations on the left/right edges, level with interior aisle rows
+    stations = []
+    for ir in range(0, interior_h, 2):
+        r = ir + 2
+        for c in (0, w - 1):
+            setf(r, c)
+            stations.append(r * w + c)
+    stations.sort()
+    # pickups: aisle cells vertically adjacent to a shelf
+    pickups = []
+    for r in range(2, h - 2):
+        for c in range(2, w - 2):
+            if free[r * w + c] and ((r - 1, c) in shelves or (r + 1, c) in shelves):
+                pickups.append(r * w + c)
+    return WarehouseGrid(width=w, height=h, free=free, docks=docks, stations=stations,
+                         pickups=pickups, name=preset)
+
+
+def grid_from_ascii(text: str, name: str = "ascii") -> WarehouseGrid:
+    """Build a grid from an ASCII map (tests): ``#`` wall, ``D`` dock,
+    ``S`` station, ``p`` pickup, anything else free."""
+    lines = [ln for ln in text.strip("\n").splitlines()]
+    h, w = len(lines), max(len(ln) for ln in lines)
+    free = [False] * (w * h)
+    docks, stations, pickups = [], [], []
+    for r, ln in enumerate(lines):
+        for c in range(w):
+            ch = ln[c] if c < len(ln) else "#"
+            cell = r * w + c
+            if ch == "#":
+                continue
+            free[cell] = True
+            if ch == "D":
+                docks.append(cell)
+            elif ch == "S":
+                stations.append(cell)
+            elif ch == "p":
+                pickups.append(cell)
+    return WarehouseGrid(width=w, height=h, free=free, docks=docks, stations=stations,
+                         pickups=pickups, name=name)

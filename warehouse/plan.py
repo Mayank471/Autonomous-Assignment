@@ -1,4 +1,10 @@
-"""The plan object exchanged between agents and stored in the reservation table."""
+"""A committed plan: where one agent will be at every future time step.
+
+``cells[k]`` is the agent's cell at time ``t0 + k``.  A plan always ends at the
+moment the agent arrives at its dock with every goal done; from then on the
+agent stays parked there forever, so ``at(t)`` returns the last cell for any
+``t`` past the end.
+"""
 
 from __future__ import annotations
 
@@ -7,69 +13,37 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Plan:
-    """A single agent's space-time route.
-
-    ``cells[i]`` is the agent's location at absolute time ``start_time + i``.
-    Consecutive entries are either equal (a wait) or 4-connected neighbours.
-    An agent is understood to remain at ``cells[-1]`` for all later times,
-    which is what makes the final cell a *permanent* reservation.
-    """
-
-    agent: int
-    start_time: int
+    t0: int
     cells: tuple[int, ...]
 
-    def __post_init__(self) -> None:
-        if not self.cells:
-            raise ValueError("a plan must contain at least one cell")
-
     @property
-    def end_time(self) -> int:
-        """Absolute time at which the agent reaches its final cell."""
-        return self.start_time + len(self.cells) - 1
-
-    @property
-    def goal(self) -> int:
-        return self.cells[-1]
-
-    @property
-    def duration(self) -> int:
-        """Number of time steps spent moving or waiting (``end_time - start_time``)."""
-        return len(self.cells) - 1
+    def end(self) -> int:
+        """Time of the last step (arrival at the dock, i.e. completion)."""
+        return self.t0 + len(self.cells) - 1
 
     def at(self, t: int) -> int:
-        """Location at absolute time ``t``, clamped to the plan's endpoints."""
-        if t <= self.start_time:
-            return self.cells[0]
-        if t >= self.end_time:
-            return self.cells[-1]
-        return self.cells[t - self.start_time]
+        k = t - self.t0
+        if k < 0:
+            raise ValueError(f"plan starts at {self.t0}, asked for t={t}")
+        return self.cells[k] if k < len(self.cells) else self.cells[-1]
 
-    def moves(self):
-        """Yield ``(from_cell, to_cell, t)`` for each transition, ``t`` its start."""
-        for i in range(len(self.cells) - 1):
-            yield self.cells[i], self.cells[i + 1], self.start_time + i
-
-    def suffix_from(self, t: int) -> "Plan":
-        """The portion of this plan from absolute time ``t`` onward."""
-        if t <= self.start_time:
+    def suffix(self, t: int) -> "Plan":
+        """The same trajectory, re-based to start at time ``t``."""
+        if t <= self.t0:
             return self
-        if t >= self.end_time:
-            return Plan(self.agent, t, (self.cells[-1],))
-        return Plan(self.agent, t, self.cells[t - self.start_time :])
+        k = t - self.t0
+        if k >= len(self.cells):
+            return Plan(t, (self.cells[-1],))
+        return Plan(t, self.cells[k:])
 
-    def concat(self, other: "Plan") -> "Plan":
-        """Append ``other`` to this plan; ``other`` must start where this one ends."""
-        if other.start_time != self.end_time:
-            raise ValueError(
-                f"cannot concatenate: ends at {self.end_time}, next starts at {other.start_time}"
-            )
-        if other.cells[0] != self.cells[-1]:
-            raise ValueError("cannot concatenate: plans do not meet at the same cell")
-        return Plan(self.agent, self.start_time, self.cells + other.cells[1:])
 
-    def with_agent(self, agent: int) -> "Plan":
-        return Plan(agent, self.start_time, self.cells)
+def plans_differ(a: Plan, b: Plan, t_from: int) -> bool:
+    end = max(a.end, b.end)
+    return any(a.at(t) != b.at(t) for t in range(t_from, end + 1))
 
-    def __len__(self) -> int:
-        return len(self.cells)
+
+def plan_distance(a: Plan, b: Plan, t_from: int) -> int:
+    """Number of time steps (from ``t_from``) at which the two plans put the
+    agent in different cells -- a plan-stability measure."""
+    end = max(a.end, b.end)
+    return sum(1 for t in range(t_from, end + 1) if a.at(t) != b.at(t))

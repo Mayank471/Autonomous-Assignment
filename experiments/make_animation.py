@@ -1,16 +1,9 @@
-"""Render a warehouse run as an animated GIF.
+"""Render a warehouse run as an animated GIF (figures/warehouse_run.gif).
 
-Shows a single scenario executing: agents moving along their routes, cells
-going dark as they are blocked, and agents changing colour for a few frames
-when a repair alters their plan.  The point is to make the *locality* of repair
-visible -- when a disruption lands, only a handful of nearby agents light up
-while the rest of the fleet carries on undisturbed.
+    python experiments/make_animation.py --agents 15 --rho 0.03 --seed 1
 
-Usage::
-
-    python experiments/make_animation.py                       # default scenario
-    python experiments/make_animation.py --strategy full_replan
-    python experiments/make_animation.py --agents 25 --density 0.02
+Agents are dots (ring = broken down); blocked cells are dark squares; an agent
+whose plan was changed by the most recent repair flashes with a halo.
 """
 
 from __future__ import annotations
@@ -19,147 +12,87 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
 from matplotlib.animation import FuncAnimation, PillowWriter  # noqa: E402
 
-from warehouse import scenario  # noqa: E402
-from warehouse.repair import RepairConfig  # noqa: E402
-from warehouse.simulator import simulate  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from warehouse.disruptions import EventRates, make_schedule  # noqa: E402
+from warehouse.scenario import make_instance  # noqa: E402
+from warehouse.simulator import SimConfig, World, handle_event, initial_plans  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-FIGURES = ROOT / "figures"
-
-FLOOR = "#F5F3EF"
-SHELF = "#C3BDB4"
-BLOCKED = "#6E2A2A"
-AGENT = "#2E6FA7"
-REPAIRED = "#D4761E"
-DOCK = "#DCD6CC"
-
-
-def build_frames(args) -> tuple:
-    grid = scenario.make_grid(n_rows=args.rows, n_cols=args.cols)
-    sc = scenario.build(grid, args.agents, args.seed)
-    disruptions = sc.disruptions(density=args.density)
-
-    result = simulate(
-        grid,
-        sc.fresh_tasks(),
-        sc.solution,
-        disruptions,
-        strategy=args.strategy,
-        config=RepairConfig(),
-        seed=args.seed,
-        move_filter=sc.move_filter,
-        record_history=True,
-    )
-    return grid, sc, result, disruptions
-
-
-def render(args) -> Path:
-    grid, sc, result, disruptions = build_frames(args)
-    history = result.history
-    if not history:
-        raise SystemExit("simulation produced no frames")
-
-    # When each cell becomes blocked, so the animation reveals them in time.
-    blocked_at: dict[int, int] = {}
-    for when, kind, cell in result.disruption_log:
-        if kind in ("CellBlockage", "AgentBreakdown"):
-            blocked_at.setdefault(cell, when)
-
-    base = np.full((grid.n_rows, grid.n_cols, 3), _rgb(FLOOR))
-    for r in range(grid.n_rows):
-        for c in range(grid.n_cols):
-            if not grid.passable[r, c]:
-                base[r, c] = _rgb(SHELF)
-    for dock in grid.dock_points:
-        r, c = grid.rc(dock)
-        base[r, c] = _rgb(DOCK)
-
-    step = max(1, args.every)
-    frames = list(range(0, len(history), step))
-
-    fig, ax = plt.subplots(figsize=(args.cols / 9, args.rows / 9))
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    image = ax.imshow(base, interpolation="nearest")
-    scatter = ax.scatter([], [], s=args.dot, c=AGENT, edgecolors="white", linewidths=0.4, zorder=3)
-    title = ax.set_title("", fontsize=9, loc="left")
-
-    def draw(index: int):
-        now = frames[index]
-        canvas = base.copy()
-        for cell, when in blocked_at.items():
-            if when <= now:
-                r, c = grid.rc(cell)
-                canvas[r, c] = _rgb(BLOCKED)
-        image.set_data(canvas)
-
-        positions = history[now]
-        rows, cols, colours = [], [], []
-        for agent, cell in positions.items():
-            r, c = grid.rc(cell)
-            rows.append(r)
-            cols.append(c)
-            colours.append(AGENT)
-        scatter.set_offsets(np.column_stack([cols, rows]))
-        scatter.set_color(colours)
-
-        events = sum(1 for when, _, _ in result.disruption_log if when <= now)
-        title.set_text(
-            f"{args.strategy}   t={now}   disruptions so far: {events}   "
-            f"blocked cells: {sum(1 for w in blocked_at.values() if w <= now)}"
-        )
-        return image, scatter, title
-
-    animation = FuncAnimation(fig, draw, frames=len(frames), interval=args.interval, blit=False)
-
-    FIGURES.mkdir(parents=True, exist_ok=True)
-    out = FIGURES / args.out
-    animation.save(out, writer=PillowWriter(fps=args.fps))
-    plt.close(fig)
-
-    metrics = result.metrics
-    print(
-        f"  {len(frames)} frames | {metrics.n_disruptions} disruptions | "
-        f"{metrics.repairs_performed} repairs | "
-        f"{metrics.mean_agents_changed:.2f} agents changed per disruption"
-    )
-    return out
-
-
-def _rgb(hex_colour: str) -> tuple[float, float, float]:
-    hex_colour = hex_colour.lstrip("#")
-    return tuple(int(hex_colour[i : i + 2], 16) / 255 for i in (0, 2, 4))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--strategy", default="adopt")
-    parser.add_argument("--agents", type=int, default=20)
-    parser.add_argument("--density", type=float, default=0.015)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--rows", type=int, default=30)
-    parser.add_argument("--cols", type=int, default=36)
-    parser.add_argument("--every", type=int, default=2, help="keep every Nth step")
-    parser.add_argument("--fps", type=int, default=12)
-    parser.add_argument("--interval", type=int, default=80)
-    parser.add_argument("--dot", type=float, default=22)
-    parser.add_argument("--out", default="warehouse_run.gif")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--agents", type=int, default=15)
+    ap.add_argument("--rho", type=float, default=0.03)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--strategy", default="krcbs")
+    args = ap.parse_args()
 
-    print(f"Rendering {args.strategy} with {args.agents} agents...")
-    out = render(args)
-    print(f"Wrote {out}")
+    inst = make_instance(args.agents, args.seed)
+    plans = initial_plans(inst)
+    horizon = max(p.end for p in plans.values())
+    events = sorted(make_schedule(inst, horizon, EventRates(rho=args.rho), args.seed),
+                    key=lambda e: (e.t, e.eid))
+    cfg = SimConfig(strategy=args.strategy)
+    world = World(inst, plans)
+    frames = []
+    pending = list(events)
+    halo: dict[int, int] = {}
+    while not world.all_done() and world.t < 1000:
+        due = [e for e in pending if e.t <= world.t]
+        pending = [e for e in pending if e.t > world.t]
+        for ev in due:
+            old = dict(world.plans)
+            status, rec = handle_event(world, ev, cfg)
+            if status == "deferred":
+                pending.append(type(ev)(ev.kind, world.t + 1, ev.eid, ev.cell, ev.agent,
+                                        ev.duration, ev.pickup, ev.station))
+            for a in range(world.n_agents):
+                if world.plans[a] is not old[a]:
+                    halo[a] = world.t + 4
+        blocked = [c for c, s, e, o in world.obstacles.items() if s <= world.t < e and o < 0]
+        frames.append((world.t, [world.position(a) for a in range(world.n_agents)],
+                       [world.is_broken(a) for a in range(world.n_agents)], blocked,
+                       {a for a, until in halo.items() if until >= world.t}))
+        world.step()
+
+    g = inst.grid
+    fig, ax = plt.subplots(figsize=(8, 5.4))
+    img = [[1.0 if not g.free[r * g.width + c] else 0.0 for c in range(g.width)]
+           for r in range(g.height)]
+    ax.imshow(img, cmap="Greys", vmin=0, vmax=3.2)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    dots = ax.scatter([], [], s=60, c="#2a78d6", edgecolors="#fcfcfb", linewidths=1, zorder=3)
+    rings = ax.scatter([], [], s=160, facecolors="none", edgecolors="#e34948", linewidths=2, zorder=4)
+    halos = ax.scatter([], [], s=260, facecolors="none", edgecolors="#eda100", linewidths=2, zorder=2)
+    blocks = ax.scatter([], [], s=120, marker="s", c="#0b0b0b", zorder=1)
+    title = ax.set_title("")
+
+    def xy(cells):
+        return [(g.rc(c)[1], g.rc(c)[0]) for c in cells] or [(float("nan"), float("nan"))]
+
+    def update(i):
+        t, pos, broken, blocked, changed = frames[i]
+        dots.set_offsets(xy(pos))
+        rings.set_offsets(xy([p for p, b in zip(pos, broken) if b]))
+        halos.set_offsets(xy([pos[a] for a in changed]))
+        blocks.set_offsets(xy(blocked))
+        title.set_text(f"t = {t}   ({args.strategy}; orange halo = plan just changed, "
+                       f"red ring = broken down)")
+        return dots, rings, halos, blocks, title
+
+    anim = FuncAnimation(fig, update, frames=len(frames), interval=120, blit=False)
+    out = ROOT / "figures" / "warehouse_run.gif"
+    anim.save(out, writer=PillowWriter(fps=8))
+    print("wrote", out)
 
 
 if __name__ == "__main__":

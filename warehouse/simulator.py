@@ -1,460 +1,356 @@
 """Discrete-time execution of a warehouse run, with disruptions and repair.
 
-One time step is: inject whatever disruptions are scheduled for now and repair
-the damage, then advance every agent one cell along its current plan, then
-update what each agent has finished.
+Each time step:
 
-Two properties of this loop matter for the results to mean anything.
+1. apply the disruptions due now; each agent checks its own plan against the
+   new world, and the agents whose plans broke (*forced* agents) start a repair
+   session using the chosen strategy;
+2. commit the repaired plans, then check them with the independent checker
+   (and check that every new plan still achieves its agent's goals);
+3. move every agent one step along its committed plan.
 
-*Repair is local in time as well as space.*  Only the agents drawn into an
-episode are touched; everyone else keeps executing the plan they already had.
-That is PGP mechanism 5 (asynchrony) -- there is no global barrier where the
-fleet stops and waits for a new joint plan, which is exactly what the
-``full_replan`` baseline does instead.
-
-*The disruption schedule is drawn once, up front, from a seeded RNG.*  Every
-strategy therefore faces the identical sequence of events on identical
-scenarios, so differences in the numbers are attributable to the repair
-strategy rather than to luck.
+A repair that fails is recorded as a failure and ends the episode: no plan is
+ever invented to paper over it.
 """
 
 from __future__ import annotations
 
-import random
+import heapq
+import time
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Mapping, Sequence
 
-from .abstractplan import abstract_plan, build_abstracts
-from .contractnet import reallocate_tasks
-from .disruptions import (
-    AgentBreakdown,
-    CellBlockage,
-    Disruption,
-    EmergencyTask,
-    summarise,
-)
-from .emergency import allocate_emergency, inject_emergency_task
-from .grid import WarehouseGrid
-from .metrics import RunMetrics
-from .obstacles import DynamicObstacles
-from .organization import MetaLevelOrganization
-from .plan import Plan
-from .planner import MapfSolution
+from .disruptions import BLOCKAGE, BREAKDOWN, EMERGENCY, Event
+from .emergency import earliest_delivery, insert_emergency
+from .obstacles import ObstacleWindows
+from .plan import Plan, plan_distance
+from .planner import prioritized
 from .repair import RepairConfig, RepairContext, repair
-from .repair.candidates import safe_prefix
-from .reservation import ReservationTable
-from .stastar import HeuristicCache
-from .tasks import AgentTasks
+from .scenario import Instance
+from .stastar import Query, advance
+from .tasks import DELIVERY, E_DELIVERY, Mission
+from .validate import PlanViolation, assert_plans
 
 
 @dataclass
-class SimulationResult:
-    """Outcome of one run."""
+class SimConfig:
+    strategy: str = "krcbs"
+    validate: bool = True
+    t_cap: int = 3000
+    emergency_slack: int | None = 0         # None = no deadline at all
+    max_deferral: int = 20
+    repair: RepairConfig = field(default_factory=RepairConfig)
 
-    metrics: RunMetrics
-    finish_times: dict[int, int] = field(default_factory=dict)
-    history: list[dict[int, int]] = field(default_factory=list)
-    disruption_log: list[tuple[int, str, int]] = field(default_factory=list)
-    blocked_cells: set[int] = field(default_factory=set)
+
+@dataclass
+class AgentState:
+    mission: Mission
+    progress: int = 0
+    done_time: int | None = None
+    broken_until: int = -1
+    deadline: tuple[int, int] | None = None     # (absolute goal index, latest time)
+    emergency_earliest: int | None = None
+
+
+def initial_plans(inst: Instance) -> dict[int, Plan]:
+    queries = [Query(m.agent, m.dock, 0, tuple(m.goals), m.dock) for m in inst.missions]
+    out = prioritized(inst.grid, queries, obstacles=ObstacleWindows())
+    if not out.ok:
+        raise RuntimeError(f"initial planning failed (seed {inst.seed})")
+    return out.plans
+
+
+class World:
+    def __init__(self, inst: Instance, plans: dict[int, Plan]) -> None:
+        self.inst = inst
+        self.grid = inst.grid
+        self.t = 0
+        self.plans = dict(plans)
+        self.obstacles = ObstacleWindows()
+        self.agents = [AgentState(m.copy()) for m in inst.missions]
+        self.failed = False
+        self.emergency_lateness: list[int] = []
+        for a, st in enumerate(self.agents):
+            st.progress = advance(st.mission.goals, 0, self.plans[a].at(0))
+
+    # ---------------------------------------------------------------- queries
+    @property
+    def n_agents(self) -> int:
+        return len(self.agents)
+
+    def position(self, a: int) -> int:
+        return self.plans[a].at(self.t)
+
+    def active_agents(self) -> list[int]:
+        return [a for a, st in enumerate(self.agents) if st.done_time is None]
+
+    def is_broken(self, a: int) -> bool:
+        return self.agents[a].broken_until > self.t
+
+    def all_done(self) -> bool:
+        return all(st.done_time is not None for st in self.agents)
+
+    def docks(self) -> dict[int, int]:
+        return {a: st.mission.dock for a, st in enumerate(self.agents)}
+
+    def query(self, a: int) -> Query:
+        st = self.agents[a]
+        hold = st.broken_until if st.broken_until > self.t else -1
+        dl = None
+        if st.deadline is not None and st.deadline[0] >= st.progress:
+            dl = (st.deadline[0] - st.progress, st.deadline[1])
+        return Query(a, self.position(a), self.t, tuple(st.mission.goals[st.progress:]),
+                     st.mission.dock, hold, dl)
+
+    def copy(self) -> "World":
+        w = World.__new__(World)
+        w.inst, w.grid, w.t = self.inst, self.grid, self.t
+        w.plans = dict(self.plans)
+        w.obstacles = self.obstacles.copy()
+        w.agents = [AgentState(st.mission.copy(), st.progress, st.done_time, st.broken_until,
+                               st.deadline, st.emergency_earliest) for st in self.agents]
+        w.failed = self.failed
+        w.emergency_lateness = list(self.emergency_lateness)
+        return w
+
+    # -------------------------------------------------------------- dynamics
+    def step(self) -> None:
+        self.t += 1
+        t = self.t
+        for a, st in enumerate(self.agents):
+            if st.done_time is not None:
+                continue
+            st.progress = advance(st.mission.goals, st.progress, self.plans[a].at(t))
+            if st.deadline is not None and st.progress > st.deadline[0]:
+                if st.emergency_earliest is not None:
+                    self.emergency_lateness.append(t - st.emergency_earliest)
+                st.deadline = None
+                st.emergency_earliest = None
+            if st.progress == len(st.mission.goals):
+                st.done_time = t
+        self.obstacles.prune(t)
+
+    def soc(self) -> int:
+        return sum(st.done_time for st in self.agents)
+
+    def projected_soc(self) -> int:
+        """Total completion time if nothing else goes wrong."""
+        return sum(st.done_time if st.done_time is not None else self.plans[a].end
+                   for a, st in enumerate(self.agents))
+
+
+# ------------------------------------------------------------------- events
+def _forced_by_cell(world: World, cell: int, t1: int, t2: int, skip: int = -1) -> dict[int, int]:
+    """Agents whose plan occupies ``cell`` at some time in [t1, t2] -> first time."""
+    out = {}
+    for a in world.active_agents():
+        if a == skip:
+            continue
+        p = world.plans[a]
+        for tau in range(t1, min(t2, p.end) + 1):
+            if p.at(tau) == cell:
+                out[a] = tau
+                break
+    return out
+
+
+def apply_event(world: World, ev: Event, cfg: SimConfig) -> tuple[str, list[int], int | None]:
+    """Apply ``ev`` at ``world.t``.
+
+    Returns ``(status, forced agents ordered by when their plan breaks,
+    disruption cell)`` where status is ``applied``, ``deferred`` or ``skipped``.
+    """
+    t = world.t
+    g = world.grid
+    if ev.kind == BLOCKAGE:
+        if any(world.position(a) == ev.cell for a in range(world.n_agents)):
+            return "deferred", [], ev.cell
+        world.obstacles.add(ev.cell, t, t + ev.duration)
+        hit = _forced_by_cell(world, ev.cell, t + 1, t + ev.duration - 1)
+        return "applied", sorted(hit, key=lambda a: (hit[a], a)), ev.cell
+
+    if ev.kind == BREAKDOWN:
+        b = ev.agent
+        st = world.agents[b]
+        if st.done_time is not None or world.is_broken(b):
+            return "skipped", [], None
+        c = world.position(b)
+        until = t + ev.duration
+        world.obstacles.add(c, t, until + 1, owner=b)
+        st.broken_until = until
+        hit = _forced_by_cell(world, c, t + 1, until, skip=b)
+        p = world.plans[b]
+        moves = [tau for tau in range(t, until + 1) if p.at(tau) != c]
+        if moves:
+            hit[b] = moves[0]
+        return "applied", sorted(hit, key=lambda a: (hit[a], a)), c
+
+    if ev.kind == EMERGENCY:
+        n = world.n_agents
+        e = None
+        for k in range(n):
+            a = (ev.agent + k) % n
+            st = world.agents[a]
+            if st.done_time is None and not world.is_broken(a) and st.deadline is None:
+                e = a
+                break
+        if e is None:
+            return "skipped", [], None
+        st = world.agents[e]
+        pos = world.position(e)
+        earliest = earliest_delivery(g, e, pos, t, ev.pickup, ev.station, st.mission.dock,
+                                     world.obstacles)
+        if earliest is None:
+            return "skipped", [], None
+        d_idx = insert_emergency(st.mission, st.progress, ev.pickup, ev.station)
+        st.progress = advance(st.mission.goals, st.progress, pos)
+        if cfg.emergency_slack is not None:
+            st.deadline = (d_idx, earliest + cfg.emergency_slack)
+        else:
+            st.deadline = (d_idx, 1 << 30)
+        st.emergency_earliest = earliest
+        return "applied", [e], ev.pickup
+
+    raise ValueError(ev.kind)
+
+
+def _check_goals(world: World, a: int, plan: Plan) -> None:
+    st = world.agents[a]
+    goals = st.mission.goals
+    p = plan.suffix(world.t)
+    if p.t0 != world.t or p.cells[0] != world.position(a):
+        raise PlanViolation(f"agent {a}: plan does not start where the agent is")
+    k = st.progress
+    for c in p.cells:
+        k = advance(goals, k, c)
+    if k != len(goals) or p.cells[-1] != st.mission.dock:
+        raise PlanViolation(f"agent {a}: plan does not complete its goals")
+
+
+def make_context(world: World, forced: list[int], cell: int | None,
+                 cfg: SimConfig) -> RepairContext:
+    return RepairContext(world.grid, world.t, dict(world.plans), world.obstacles,
+                         tuple(forced), frozenset(world.active_agents()), world.query,
+                         cell, cfg.repair)
+
+
+def handle_event(world: World, ev: Event, cfg: SimConfig) -> tuple[str, dict]:
+    """Apply one event and repair.  Returns ``(status, record)``."""
+    status, forced, cell = apply_event(world, ev, cfg)
+    rec = {"eid": ev.eid, "kind": ev.kind, "t": world.t, "status": status,
+           "forced": len(forced), "n_active": len(world.active_agents())}
+    if status != "applied" or not forced:
+        rec.update(changed=0, collateral=0)
+        return status, rec
+    ctx = make_context(world, forced, cell, cfg)
+    old = ctx.plans
+    t0 = time.perf_counter()
+    res = repair(cfg.strategy, ctx)
+    runtime = time.perf_counter() - t0
+    rec.update(level=res.level, hl_nodes=res.hl_nodes, ll_calls=res.session.ll_calls,
+               ll_expansions=res.session.ll_expansions, runtime_s=runtime,
+               exact=res.exact, deadline_relaxed=res.deadline_relaxed)
+    if not res.ok:
+        world.failed = True
+        rec.update(changed=0, collateral=0, failed=True)
+        return status, rec
+    missing = [a for a in forced if a not in res.plans]
+    if missing:
+        raise PlanViolation(f"strategy {cfg.strategy} left forced agents {missing} unrepaired")
+    changed = res.session.close(old, res.plans, world.t)
+    new = dict(old)
+    for a in changed:
+        new[a] = res.plans[a]
+    if cfg.validate:
+        for a in sorted(changed | set(forced)):
+            _check_goals(world, a, new[a])
+        assert_plans(world.grid, {a: new[a] for a in range(world.n_agents)}, world.t,
+                     docks=world.docks(), obstacles=world.obstacles,
+                     context=f"{cfg.strategy} after event {ev.eid} ({ev.kind}) at t={world.t}")
+    world.plans = new
+    rec.update(
+        changed=len(changed),
+        collateral=len(changed - set(forced)),
+        contacted=len(res.session.contacted),
+        messages=res.session.n_messages,
+        plan_distance=sum(plan_distance(old[a], new[a], world.t) for a in changed),
+        soc_delta=sum(new[a].end - old[a].end for a in changed),
+        failed=False,
+    )
+    return status, rec
+
+
+# ------------------------------------------------------------------ episodes
+@dataclass
+class EpisodeResult:
+    strategy: str
+    n_agents: int
+    seed: int
+    completed: bool
+    soc: int | None
+    makespan: int | None
+    soc0: int
+    agents_done: float
+    deliveries_done: float
+    records: list[dict]
+    levels: Counter
+    realized_density: float
+    emergency_lateness: list[int]
+    runtime_s: float
 
     @property
-    def total_timesteps(self) -> int:
-        return self.metrics.total_timesteps
+    def repairs(self) -> list[dict]:
+        return [r for r in self.records if r["status"] == "applied" and r["forced"] > 0]
 
 
-def simulate(
-    grid: WarehouseGrid,
-    agent_tasks: dict[int, AgentTasks],
-    solution: MapfSolution,
-    disruptions: Sequence[Disruption],
-    *,
-    strategy: str,
-    config: RepairConfig | None = None,
-    obstacles: DynamicObstacles | None = None,
-    move_filter: Callable[[int, int], bool] | None = None,
-    seed: int = 0,
-    max_steps: int | None = None,
-    record_history: bool = False,
-    verbose: bool = False,
-) -> SimulationResult:
-    """Execute the fleet's plans, injecting ``disruptions`` and repairing.
+def _delivery_fraction(world: World) -> float:
+    total = done = 0
+    for st in world.agents:
+        for k, kind in enumerate(st.mission.kinds):
+            if kind in (DELIVERY, E_DELIVERY):
+                total += 1
+                done += k < st.progress
+    return done / total if total else 1.0
 
-    Args:
-        solution: the initial joint plan.  Its reservation table is *copied*,
-            so one precomputed solution can be replayed under every strategy.
-        max_steps: safety bound.  Defaults to a generous multiple of the
-            planned makespan.
-    """
-    config = config or RepairConfig()
-    rng = random.Random(seed)
 
-    # Work on copies so the caller's precomputed solution stays reusable.
-    reservations = solution.reservations.copy()
-    obstacles = obstacles.copy() if obstacles is not None else DynamicObstacles()
-    heuristics = HeuristicCache(grid, obstacles, move_filter=move_filter)
-    tasks = {a: AgentTasks(a, t.start, list(t.tasks), t.home) for a, t in agent_tasks.items()}
-
-    mlo = MetaLevelOrganization.from_priority(grid, solution.priority_order)
-    mlo.assign_zone_coordinators(build_abstracts(grid, solution.plans))
-
-    agents = list(tasks)
-    positions = {a: reservations.plan_of(a).at(0) for a in agents if reservations.plan_of(a)}
-    progress = {a: 0 for a in agents}
-    stages = {a: 0 for a in agents}
-    broken: set[int] = set()
-    finished: dict[int, int] = {}
-
-    metrics = RunMetrics(
-        strategy=strategy,
-        n_agents=len(agents),
-        seed=seed,
-        beta=config.beta,
-        tau=config.tau,
-        k_max=config.k_max,
-        epsilon=config.epsilon,
-        social_laws=move_filter is not None,
-        tasks_total=sum(len(t.tasks) for t in tasks.values()),
-        n_disruptions=len(disruptions),
-        disruptions_by_kind=summarise(disruptions),
-        initial_plan_ms=solution.planning_time_ms,
-        initial_sum_of_costs=solution.sum_of_costs,
-    )
-
-    horizon = solution.makespan
-    max_steps = max_steps if max_steps is not None else max(200, horizon * 3 + 100)
-
-    ctx = RepairContext(
-        grid=grid,
-        obstacles=obstacles,
-        heuristics=heuristics,
-        reservations=reservations,
-        agent_tasks=tasks,
-        positions=positions,
-        progress=progress,
-        stages=stages,
-        now=0,
-        config=config,
-        mlo=mlo,
-        broken=broken,
-        move_filter=move_filter,
-    )
-
-    schedule: dict[int, list[Disruption]] = {}
-    for disruption in disruptions:
-        schedule.setdefault(disruption.time, []).append(disruption)
-
-    result = SimulationResult(metrics=metrics)
-    emergency_count = 0
-    end_of_run = max_steps
-
-    for now in range(max_steps + 1):
-        ctx.now = now
-
-        # ---------------------------------------------------------- disrupt
-        for disruption in schedule.get(now, ()):
-            applied = _apply(
-                disruption, ctx, rng, emergency_index=emergency_count, metrics=metrics
-            )
-            if applied is None:
+def run_episode(inst: Instance, plans0: dict[int, Plan], events: list[Event],
+                cfg: SimConfig) -> EpisodeResult:
+    t_start = time.perf_counter()
+    world = World(inst, plans0)
+    soc0 = sum(p.end for p in plans0.values())
+    heap = [(e.t, e.eid, 0, e) for e in events]
+    heapq.heapify(heap)
+    records: list[dict] = []
+    blocked_area = 0
+    steps = 0
+    while not world.all_done() and not world.failed and world.t <= cfg.t_cap:
+        while heap and heap[0][0] <= world.t:
+            _, eid, deferrals, ev = heapq.heappop(heap)
+            status, rec = handle_event(world, ev, cfg)
+            if status == "deferred":
+                if deferrals < cfg.max_deferral:
+                    heapq.heappush(heap, (world.t + 1, eid, deferrals + 1, ev))
                 continue
-            if isinstance(disruption, EmergencyTask):
-                emergency_count += 1
-            result.disruption_log.append((now, disruption.kind, applied))
-
-            outcome = repair(strategy, disruption, ctx)
-            trimmed = enforce_no_conflicts(ctx)
-            metrics.safety_truncations += trimmed
-            if outcome is not None:
-                metrics.record_repair(outcome)
-                if verbose:
-                    print(
-                        f"  t={now:4d} {disruption.kind:16s} "
-                        f"involved={outcome.n_involved} changed={outcome.n_changed} "
-                        f"{outcome.wall_ms:.1f}ms"
-                    )
-
-        # ------------------------------------------------------------- move
-        everyone_done = True
-        anyone_moving = False
-        for agent in agents:
-            if agent in broken or agent in finished:
-                continue
-            plan = reservations.plan_of(agent)
-            if plan is None:
-                continue
-            positions[agent] = plan.at(now + 1)
-            everyone_done = False
-            if plan.end_time > now + 1:
-                anyone_moving = True
-
-        if record_history:
-            result.history.append(dict(positions))
-
-        # --------------------------------------------------------- progress
-        for agent in agents:
-            if agent in broken or agent in finished:
-                continue
-            _advance_progress(agent, tasks, positions, progress, stages)
-            if _is_finished(agent, tasks, positions, progress):
-                finished[agent] = now + 1
-
-        if everyone_done or len(finished) + len(broken) >= len(agents):
-            end_of_run = now + 1
+            records.append(rec)
+            if world.failed:
+                break
+        if world.failed:
             break
-
-        # Deadlock: every unfinished agent has run its plan out and is parked
-        # short of its dock, so no further progress is possible.  Stopping here
-        # rather than idling to ``max_steps`` keeps the cost of a failed repair
-        # honest instead of dominated by the safety bound.
-        if not anyone_moving:
-            end_of_run = now + 1
-            break
-
-    # ------------------------------------------------------------- tally up
-    # An agent that never finishes is charged to the end of the run: it did not
-    # accomplish its tasks, and pretending its clock stopped early would reward
-    # a strategy for stranding agents.
-    stranded = [a for a in agents if a not in finished and a not in broken]
-    for agent in agents:
-        if agent not in finished:
-            finished[agent] = end_of_run
-
-    metrics.total_timesteps = sum(finished.values())
-    metrics.makespan = max(finished.values(), default=0)
-    metrics.agents_finished = len(agents) - len(stranded) - len(broken)
-    metrics.agents_stranded = len(stranded)
-    metrics.tasks_completed = sum(progress[a] for a in agents)
-    metrics.collisions_detected = len(reservations.find_conflicts())
-
-    result.finish_times = finished
-    result.blocked_cells = obstacles.all_cells()
-    return result
-
-
-# ---------------------------------------------------------------- internals
-
-
-def enforce_no_conflicts(ctx: RepairContext, max_passes: int = 12) -> int:
-    """Last line of defence: guarantee the joint plan is collision-free.
-
-    Every strategy is meant to produce a safe plan, and each checks its own
-    output.  The path that can still fail is parking an agent that cannot
-    finish: if its dock is unreachable and every nearby cell is spoken for, it
-    ends up standing where it is, and a stationary robot is a wall that other
-    agents' committed plans may already run through.
-
-    Conflicts are resolved by rebuilding the joint plan, trimming each agent to
-    the longest prefix it can execute and then *hold* given everyone placed
-    before it -- a queue forming behind a stalled robot.
-
-    The subtlety is ordering.  An agent that cannot move is an obstacle, not a
-    participant, so it must be placed first and the movers routed around it.
-    Two earlier attempts at this failed, and both failures are instructive:
-
-    * Ordering purely by authority let a senior *mover* claim the cell a stalled
-      agent was standing on -- unfixable on that pass.
-    * Classifying "immovable" freshly each pass oscillated.  An agent trimmed to
-      a standstill during pass *k* was still classed as a mover during pass
-      *k+1* if its plan had meanwhile been rebuilt, so two agents could take
-      turns displacing each other indefinitely.
-
-    The fix is a **monotone** frozen set: once an agent is frozen it stays
-    frozen, and any agent that cannot be placed joins it.  That makes the loop
-    terminate for a countable reason -- every pass either resolves all conflicts
-    or grows the frozen set by at least one, and the set is bounded by the fleet
-    size.
-
-    Returns the number of agents that had to be trimmed.
-    """
-    frozen: set[int] = set(ctx.broken)
-    trimmed_total = 0
-
-    for _ in range(max_passes):
-        if not ctx.reservations.find_conflicts():
-            break
-
-        plans = {
-            a: p
-            for a, p in ((a, ctx.reservations.plan_of(a)) for a in ctx.agent_tasks)
-            if p is not None
-        }
-        if not plans:
-            break
-
-        # Anything already reduced to standing still is immovable in fact.
-        for agent, plan in plans.items():
-            if len(plan.suffix_from(ctx.now).cells) == 1:
-                frozen.add(agent)
-
-        rebuilt = ReservationTable()
-        for tasks in ctx.agent_tasks.values():
-            if tasks.home is not None:
-                rebuilt.dedicate(tasks.home, tasks.agent)
-
-        # Frozen agents first: they are obstacles the others must route around.
-        for agent in sorted(frozen & plans.keys(), key=ctx.mlo.rank):
-            rebuilt.add(Plan(agent, ctx.now, (ctx.positions[agent],)))
-
-        trimmed = 0
-        movers = sorted(plans.keys() - frozen, key=ctx.mlo.rank)
-        for agent in movers:
-            suffix = plans[agent].suffix_from(ctx.now)
-            safe = safe_prefix(suffix, ctx, rebuilt)
-            if safe is None:
-                # Cannot be accommodated at all.  Freeze it permanently; the
-                # next pass places it first and the others give way.
-                frozen.add(agent)
-                safe = Plan(agent, ctx.now, (ctx.positions[agent],))
-            if safe.cells != suffix.cells:
-                trimmed += 1
-            rebuilt.add(safe)
-
-        ctx.reservations.clear()
-        for tasks in ctx.agent_tasks.values():
-            if tasks.home is not None:
-                ctx.reservations.dedicate(tasks.home, tasks.agent)
-        for plan in rebuilt.plans():
-            ctx.reservations.add(plan)
-        ctx.reservations.rebuild_last_use()
-        trimmed_total += trimmed
-
-    return trimmed_total
-
-
-def _apply(
-    disruption: Disruption,
-    ctx: RepairContext,
-    rng: random.Random,
-    *,
-    emergency_index: int,
-    metrics: RunMetrics,
-) -> int | None:
-    """Make the disruption real.  Returns a describing id, or ``None`` if void.
-
-    A disruption can turn out to be void -- a cell blocked where an agent is
-    already standing, or a breakdown of an agent that already failed.  Those
-    are skipped rather than forced, and are not counted as repairs.
-    """
-    if isinstance(disruption, CellBlockage):
-        occupied = {p for a, p in ctx.positions.items() if a not in ctx.broken}
-        if disruption.cell in occupied:
-            return None  # cannot wall in an agent that is standing there
-        if ctx.reservations.dock_owner(disruption.cell) is not None:
-            return None  # a dock is not a travel cell
-        if not ctx.obstacles.block(disruption.cell, ctx.now):
-            return None
-        return disruption.cell
-
-    if isinstance(disruption, AgentBreakdown):
-        agent = disruption.agent
-        if agent in ctx.broken:
-            return None
-        cell = ctx.positions.get(agent)
-        if cell is None:
-            return None
-
-        ctx.broken.add(agent)
-        ctx.obstacles.block(cell, ctx.now)
-        # The failed agent holds its cell for good.
-        ctx.reservations.remove(agent)
-        ctx.reservations.add(Plan(agent, ctx.now, (cell,)))
-
-        # Its unfinished work is re-auctioned (Ch 11 section 3.3 contract net).
-        outcome = reallocate_tasks(
-            ctx.grid,
-            agent,
-            ctx.agent_tasks,
-            ctx.progress,
-            ctx.positions,
-            ctx.active_agents(),
-        )
-        metrics.repair_messages.append(outcome.messages)
-        if outcome.unawarded:
-            metrics.notes.append(
-                f"t={ctx.now}: {len(outcome.unawarded)} tasks of agent {agent} went unclaimed"
-            )
-        return cell
-
-    if isinstance(disruption, EmergencyTask):
-        active = ctx.active_agents()
-        next_waypoints = {
-            a: _next_waypoint(a, ctx.agent_tasks, ctx.progress, ctx.stages)
-            for a in active
-        }
-        allocation = allocate_emergency(
-            disruption,
-            ctx.grid,
-            ctx.positions,
-            next_waypoints,
-            active,
-            epsilon=ctx.config.epsilon,
-        )
-        if not allocation.responders:
-            return None
-        for offset, responder in enumerate(allocation.responders):
-            inject_emergency_task(
-                disruption,
-                responder,
-                ctx.agent_tasks,
-                ctx.progress,
-                emergency_index * 100 + offset,
-            )
-            # An emergency is extra work the fleet did not originally have, so
-            # it joins the denominator rather than inflating the completion rate.
-            metrics.tasks_total += 1
-        metrics.repair_messages.append(allocation.messages)
-        return disruption.cell
-
-    return None
-
-
-def _next_waypoint(
-    agent: int,
-    tasks: Mapping[int, AgentTasks],
-    progress: Mapping[int, int],
-    stages: Mapping[int, int],
-) -> int | None:
-    remaining = tasks[agent].remaining_from(
-        progress.get(agent, 0), stages.get(agent, 0)
-    )
-    return remaining[0] if remaining else None
-
-
-def _advance_progress(
-    agent: int,
-    tasks: Mapping[int, AgentTasks],
-    positions: Mapping[int, int],
-    progress: dict[int, int],
-    stages: dict[int, int],
-) -> None:
-    """Mark a pickup or delivery as done when the agent stands on it."""
-    queue = tasks[agent].tasks
-    index = progress[agent]
-    if index >= len(queue):
-        return
-
-    here = positions[agent]
-    task = queue[index]
-    if stages[agent] == 0:
-        if here == task.pickup:
-            stages[agent] = 1
-            # Pickup and delivery can be the same cell (an emergency job), in
-            # which case arriving completes both.
-            if task.delivery == task.pickup:
-                progress[agent] = index + 1
-                stages[agent] = 0
-    elif here == task.delivery:
-        progress[agent] = index + 1
-        stages[agent] = 0
-
-
-def _is_finished(
-    agent: int,
-    tasks: Mapping[int, AgentTasks],
-    positions: Mapping[int, int],
-    progress: Mapping[int, int],
-) -> bool:
-    return (
-        progress[agent] >= len(tasks[agent].tasks)
-        and positions[agent] == tasks[agent].home
+        blocked_area += world.obstacles.active_count(world.t)
+        steps += 1
+        world.step()
+    completed = world.all_done()
+    levels = Counter(r.get("level") for r in records if r.get("level"))
+    n_blockable = len(inst.grid.blockable)
+    return EpisodeResult(
+        strategy=cfg.strategy, n_agents=inst.n_agents, seed=inst.seed, completed=completed,
+        soc=world.soc() if completed else None,
+        makespan=max(st.done_time for st in world.agents) if completed else None,
+        soc0=soc0,
+        agents_done=sum(st.done_time is not None for st in world.agents) / world.n_agents,
+        deliveries_done=_delivery_fraction(world),
+        records=records, levels=levels,
+        realized_density=blocked_area / max(1, steps) / n_blockable,
+        emergency_lateness=world.emergency_lateness,
+        runtime_s=time.perf_counter() - t_start,
     )

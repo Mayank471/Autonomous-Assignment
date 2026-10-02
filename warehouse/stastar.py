@@ -1,376 +1,358 @@
-"""Space-Time A* -- the single-agent low-level search.
+"""Multi-goal Space-Time A* -- the single low-level search used everywhere.
 
-Search states are ``(cell, time)`` and the action set is the four grid moves
-plus *wait*.  Other agents enter only through the reservation table, so the
-same routine serves three roles unchanged:
+State ``(cell, t, k)``: the agent is in ``cell`` at time ``t`` and ``k`` is the
+index of the next goal it must visit.  Actions are the four moves plus wait;
+every action costs one time step, so the cost of reaching a state is fixed by
+its time step (``g = t - t0``).
 
-* the independent local plan of Ch 11 section 4 (empty reservation table);
-* one agent's turn in prioritized planning (higher-priority agents reserved);
-* a candidate repair plan (everyone else reserved, blocked cells added).
+What a search must respect:
 
-The heuristic is the true distance to the goal over the static floor, found by
-one backward BFS per goal and cached, which keeps it admissible and consistent.
+hard
+    static walls, other agents' docks, obstacle windows (blockages and frozen
+    agents), CBS constraints, an optional *hold* (a broken agent may not move
+    before it is repaired), an optional *deadline* on one goal, and the
+    reservation-board entries of every agent classified as hard.
+soft
+    board entries of agents classified as soft are passable, but each collision
+    with one counts as a *soft conflict*.
+
+The search returns the cheapest path and, among the cheapest, the one with the
+fewest soft conflicts.  This lexicographic order is exact: all paths to a state
+share the same ``g``, so the priority ``(f, soft)`` is consistent.
+
+Termination: after ``T_last`` (the latest time any dynamic constraint exists)
+the world is static, so a state popped at ``t >= T_last`` is finished with the
+static shortest route through its remaining goals, whose cost the heuristic
+already gives exactly.  The search is bounded by an expansion count, never by
+wall-clock time.
 """
 
 from __future__ import annotations
 
 import heapq
 from collections import deque
-from typing import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 
-from .grid import WarehouseGrid
-from .obstacles import DynamicObstacles
+from .grid import UNREACHABLE, WarehouseGrid
+from .obstacles import ObstacleWindows
 from .plan import Plan
-from .reservation import ReservationTable
+from .reservation import ReservationBoard
 
-INF = float("inf")
-
-#: Hard cap on node expansions per search.  A bound is needed because a
-#: space-time search over a congested floor can otherwise wander for a very
-#: long time before proving failure; hitting it is reported as "no path".
-DEFAULT_MAX_EXPANSIONS = 150_000
+OK, INFEASIBLE, BUDGET = "ok", "infeasible", "budget"
+DEFAULT_MAX_EXPANSIONS = 400_000
 
 
-class HeuristicCache:
-    """Backward-BFS distance-to-goal, cached per goal cell.
+@dataclass
+class Constraints:
+    """CBS constraints for one agent (packed keys, see reservation.py)."""
 
-    Distances ignore *other agents* (they are time-varying) but do respect
-    permanently blocked cells, which keeps the estimate admissible while making
-    it far more informed once the floor starts filling with obstacles.
+    vertex: frozenset[int] = frozenset()
+    edge: frozenset[int] = frozenset()
+    max_t: int = 0
 
-    A ``move_filter`` (social laws) makes the movement graph directed, so the
-    backward BFS traverses each edge in reverse: cell ``u`` is a predecessor of
-    ``v`` only when ``u -> v`` is actually permitted.  That yields exact
-    directed distances rather than an optimistic undirected estimate.
+    def with_vertex(self, key: int, t: int) -> "Constraints":
+        return Constraints(self.vertex | {key}, self.edge, max(self.max_t, t))
+
+    def with_edge(self, key: int, t: int) -> "Constraints":
+        return Constraints(self.vertex, self.edge | {key}, max(self.max_t, t + 1))
+
+
+NO_CONSTRAINTS = Constraints()
+
+
+@dataclass(frozen=True)
+class Query:
+    """What one agent needs to plan: where it is, and what it still has to do."""
+
+    agent: int
+    start: int
+    t0: int
+    goals: tuple[int, ...]          # remaining goals; goals[-1] is the dock
+    dock: int
+    hold_until: int = -1            # must stay at ``start`` for all t <= hold_until
+    deadline: tuple[int, int] | None = None   # (index into goals, latest arrival time)
+
+
+@dataclass
+class SearchResult:
+    status: str
+    plan: Plan | None = None
+    soft: int = 0
+    expansions: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status == OK
+
+
+def advance(goals: tuple[int, ...] | list[int], k: int, cell: int) -> int:
+    """Goal index after being in ``cell``: goals are visited strictly in order."""
+    n = len(goals)
+    while k < n and goals[k] == cell:
+        k += 1
+    return k
+
+
+@dataclass
+class _Ctx:
+    nc: int
+    goals: tuple[int, ...]
+    dists: list[list[int]]
+    rest: list[int]
+    prefix: list[int]
+
+
+def _context(grid: WarehouseGrid, goals: tuple[int, ...]) -> _Ctx:
+    dists = [grid.dist_from(g) for g in goals]
+    legs = [dists[i + 1][goals[i]] for i in range(len(goals) - 1)]
+    rest = [0] * (len(goals) + 1)
+    for i in range(len(goals) - 2, -1, -1):
+        rest[i] = rest[i + 1] + legs[i]
+    prefix = [0] * (len(goals) + 1)
+    for i in range(1, len(goals)):
+        prefix[i] = prefix[i - 1] + legs[i - 1]
+    return _Ctx(grid.n_cells, goals, dists, rest, prefix)
+
+
+def static_route(grid: WarehouseGrid, cell: int, goals: tuple[int, ...], k: int) -> list[int]:
+    """Cells visited after ``cell`` on a static shortest route through
+    ``goals[k:]`` (deterministic: lowest distance, then lowest cell id)."""
+    out = []
+    nbrs = grid.neighbors
+    while k < len(goals):
+        d = grid.dist_from(goals[k])
+        while cell != goals[k]:
+            cur = d[cell]
+            nxt = min((v for v in nbrs[cell] if d[v] == cur - 1), default=None)
+            if nxt is None:
+                raise RuntimeError("static route: goal unreachable")
+            cell = nxt
+            out.append(cell)
+        k = advance(goals, k, cell)
+    return out
+
+
+def search(grid: WarehouseGrid, q: Query, *, obstacles: ObstacleWindows,
+           board: ReservationBoard | None = None, ignore: frozenset[int] | set[int] = frozenset(),
+           hard: frozenset[int] | set[int] | None = None,
+           constraints: Constraints = NO_CONSTRAINTS,
+           cat: ReservationBoard | None = None,
+           max_expansions: int = DEFAULT_MAX_EXPANSIONS) -> SearchResult:
+    """Plan ``q.agent`` from ``q.start`` at ``q.t0`` through ``q.goals``.
+
+    Board occupants are classified as: ``q.agent`` or in ``ignore`` -> ignored;
+    ``hard is None`` or in ``hard`` -> hard; otherwise soft.
+
+    ``cat`` is an optional conflict-avoidance table (the current paths of the
+    other agents being replanned with this one): every collision with it also
+    counts as a soft conflict, which steers ties toward paths that leave the
+    others alone without ever changing the cost.
     """
+    agent, goals, t0 = q.agent, q.goals, q.t0
+    G = len(goals)
+    if G == 0:
+        return SearchResult(OK, Plan(t0, (q.start,)), 0, 0)
+    ctx = _context(grid, goals)
+    nc_total, dists, rest, prefix = ctx.nc, ctx.dists, ctx.rest, ctx.prefix
+    last_d = dists[G - 1]
+    if dists[0][q.start] >= UNREACHABLE:
+        return SearchResult(INFEASIBLE)
 
-    __slots__ = ("_grid", "_obstacles", "_cache", "_version", "_move_filter")
+    def h(cell: int, k: int) -> int:
+        return dists[k][cell] + rest[k] if k < G else last_d[cell]
 
-    def __init__(
-        self,
-        grid: WarehouseGrid,
-        obstacles: DynamicObstacles | None = None,
-        move_filter: Callable[[int, int], bool] | None = None,
-    ):
-        self._grid = grid
-        self._obstacles = obstacles if obstacles is not None else DynamicObstacles()
-        self._cache: dict[int, list[int]] = {}
-        self._version = self._obstacles.version
-        self._move_filter = move_filter
+    dock_set, own_dock = grid.dock_set, q.dock
+    nbrs = grid.neighbors
+    vcons, econs = constraints.vertex, constraints.edge
+    has_cons = bool(vcons or econs)
+    vertex = board.vertex if board is not None else {}
+    edge = board.edge if board is not None else {}
+    parked = board.parked if board is not None else {}
+    hold = q.hold_until
+    dl_idx, dl_t = q.deadline if q.deadline is not None else (-1, 0)
 
-    def _blocked(self) -> set[int]:
-        return self._obstacles.all_cells()
+    t_last = max(t0, obstacles.last_time(), constraints.max_t, hold,
+                 dl_t if q.deadline is not None else 0,
+                 board.max_t if board is not None else 0,
+                 cat.max_t if cat is not None else 0)
+    cat_v = cat.vertex if cat is not None else None
+    cat_e = cat.edge if cat is not None else None
 
-    def _invalidate_if_stale(self) -> None:
-        if self._obstacles.version != self._version:
-            self._cache.clear()
-            self._version = self._obstacles.version
+    def occupant(t: int, cell: int) -> int | None:
+        a = vertex.get(t * nc_total + cell)
+        if a is not None:
+            return a
+        p = parked.get(cell)
+        if p is not None and t >= p[1]:
+            return p[0]
+        return None
 
-    def distances(self, goal: int) -> list[int]:
-        """Distance from every cell to ``goal``; ``-1`` where unreachable."""
-        self._invalidate_if_stale()
-        dist = self._cache.get(goal)
-        if dist is not None:
-            return dist
+    def final_free(cell: int, t: int) -> bool:
+        if obstacles.blocked_after(cell, t, agent):
+            return False
+        if has_cons:
+            for tt in range(t + 1, constraints.max_t + 1):
+                if tt * nc_total + cell in vcons:
+                    return False
+        if board is not None:
+            for tt in range(t + 1, board.max_t + 1):
+                o = occupant(tt, cell)
+                if o is not None and o != agent and o not in ignore:
+                    return False
+        return True
 
-        grid = self._grid
-        blocked = self._blocked()
-        dist = [-1] * grid.n_cells
-        if goal in blocked or not grid.is_free(goal):
-            # Goal itself unusable: leave everything unreachable.
-            self._cache[goal] = dist
-            return dist
+    # Hard agents parked forever outside a dock are permanent obstacles, so the
+    # static completion must route around them.  (Never happens in the
+    # warehouse, where plans always end in private docks.)
+    permanent = frozenset(
+        c for c, (a, _) in parked.items()
+        if c not in dock_set and a != agent and a not in ignore and (hard is None or a in hard)
+    )
+    soft_parked = frozenset(
+        c for c, (a, _) in parked.items()
+        if c not in dock_set and a != agent and a not in ignore and hard is not None and a not in hard
+    )
 
-        dist[goal] = 0
-        queue = deque([goal])
-        allows = self._move_filter
-        while queue:
-            cell = queue.popleft()
-            d = dist[cell] + 1
-            for nxt in grid.neighbors(cell):
-                if dist[nxt] != -1 or nxt in blocked:
-                    continue
-                # Backward search: keep ``nxt`` only if ``nxt -> cell`` is legal.
-                if allows is not None and not allows(nxt, cell):
-                    continue
-                dist[nxt] = d
-                queue.append(nxt)
-        self._cache[goal] = dist
-        return dist
-
-    def distance(self, goal: int, cell: int) -> float:
-        d = self.distances(goal)[cell]
-        return INF if d < 0 else d
-
-    def clear(self) -> None:
-        self._cache.clear()
-
-
-def space_time_astar(
-    grid: WarehouseGrid,
-    start: int,
-    goal: int,
-    start_time: int,
-    agent: int,
-    reservations: ReservationTable,
-    obstacles: DynamicObstacles,
-    heuristics: HeuristicCache,
-    *,
-    hold: float = 0,
-    avoid: frozenset[int] | set[int] | None = None,
-    avoid_penalty: float = 0.0,
-    max_time: int | None = None,
-    max_expansions: int = DEFAULT_MAX_EXPANSIONS,
-    move_filter: Callable[[int, int], bool] | None = None,
-    blocked_vertices: frozenset[tuple[int, int]] | None = None,
-    blocked_edges: frozenset[tuple[int, int, int]] | None = None,
-) -> Plan | None:
-    """Find a minimum-cost space-time path from ``start`` to ``goal``.
-
-    Args:
-        hold: how long the agent must be able to *stay* on the goal after
-            arriving.  ``0`` for a waypoint it passes through, a positive
-            integer for one it services, ``inf`` for its final destination
-            (which makes the cell a permanent reservation).
-        avoid: cells that cost ``avoid_penalty`` extra per step.  Used to coax
-            the search into producing a genuinely different route when
-            generating alternative repair candidates; the path stays valid and
-            the heuristic stays admissible because the penalty is non-negative.
-        max_time: latest time step the search may reach.  Defaults to a bound
-            that lets an agent outwait every other committed plan.
-        move_filter: optional ``(u, v) -> bool`` convention, e.g. the one-way
-            aisle social law.  Must match the one the heuristic was built with.
-        blocked_vertices: extra ``(cell, t)`` pairs this agent may not occupy.
-        blocked_edges: extra ``(u, v, t)`` transitions this agent may not make.
-
-    ``blocked_vertices`` and ``blocked_edges`` carry constraints that belong to
-    *this agent alone* rather than to the shared reservation table, which is what
-    Conflict-Based Search needs: its high level imposes a constraint on one agent
-    and replans only that agent, leaving everyone else's plan untouched.
-
-    Returns:
-        A :class:`Plan` starting at ``start_time``, or ``None`` if no path
-        exists within the bounds.
-    """
-    dist = heuristics.distances(goal)
-    h0 = dist[start]
-    if h0 < 0:
-        return None  # goal unreachable on the static floor
-
-    if max_time is None:
-        slack = 2 * (grid.n_rows + grid.n_cols)
-        max_time = max(start_time, reservations.horizon) + h0 + slack
-
-    avoid = avoid or frozenset()
-    finite_hold = hold if hold != INF else None
-
-    # Priority queue of (f, h, counter, cell, time, g).  The counter breaks ties
-    # deterministically so runs are reproducible from the seed alone.
-    counter = 0
-    open_heap: list[tuple[float, int, int, int, int, float]] = [
-        (float(h0), h0, counter, start, start_time, 0.0)
-    ]
-    best_g: dict[tuple[int, int], float] = {(start, start_time): 0.0}
-    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    G1 = G + 1
+    k0 = advance(goals, 0, q.start)
+    if q.deadline is not None and k0 <= dl_idx and t0 + dists[k0][q.start] + prefix[dl_idx] - prefix[k0] > dl_t:
+        return SearchResult(INFEASIBLE)
+    start_key = (t0 * nc_total + q.start) * G1 + k0
+    parent: dict[int, int] = {start_key: -1}
+    best_soft: dict[int, int] = {start_key: 0}
+    closed: set[int] = set()
+    heap = [(t0 + h(q.start, k0), 0, -t0, start_key)]
     expansions = 0
 
-    while open_heap:
-        f, _h, _c, cell, t, g = heapq.heappop(open_heap)
-        if g > best_g.get((cell, t), INF):
-            continue  # stale heap entry
+    heappush, heappop = heapq.heappush, heapq.heappop
+    owin = obstacles.windows
+    # parked entries that can matter: outside docks (never in the warehouse)
+    # or another agent parked in this agent's own dock (impossible, but cheap)
+    pk = {c: v for c, v in parked.items()
+          if (c not in dock_set or c == own_dock) and v[0] != agent}
+    while heap:
+        f, s, negt, key = heappop(heap)
+        if key in closed:
+            continue
+        closed.add(key)
+        k = key % G1
+        rem = key // G1
+        cell = rem % nc_total
+        t = rem // nc_total
+
+        if k == G and (t >= t_last or final_free(cell, t)):
+            return SearchResult(OK, _build(parent, key, G1, nc_total, t0, []), s, expansions)
+        if t >= t_last:
+            if permanent:
+                tail = _route_avoiding(grid, cell, goals, k, permanent)
+                if tail is None:
+                    continue        # this branch can never finish; try others
+            else:
+                tail = static_route(grid, cell, goals, k)
+            if soft_parked:
+                s += sum(1 for c in tail if c in soft_parked)
+            return SearchResult(OK, _build(parent, key, G1, nc_total, t0, tail), s, expansions)
 
         expansions += 1
         if expansions > max_expansions:
-            return None
-
-        if cell == goal and _can_hold(
-            goal, t, finite_hold, reservations, obstacles, agent,
-            blocked_vertices=blocked_vertices,
-        ):
-            return _reconstruct(agent, start_time, parent, (cell, t))
+            return SearchResult(BUDGET, None, 0, expansions)
 
         nt = t + 1
-        if nt > max_time:
-            continue
-
-        for nxt in (cell, *grid.neighbors(cell)):
-            if nxt != cell and move_filter is not None and not move_filter(cell, nxt):
+        moves = (cell,) if t < hold else (cell,) + nbrs[cell]
+        for ncell in moves:
+            if ncell != cell and ncell in dock_set and ncell != own_dock:
                 continue
-            if obstacles.is_blocked(nxt, nt):
+            ws = owin.get(ncell)
+            if ws is not None:
+                hit = False
+                for ws_s, ws_e, ws_o in ws:
+                    if ws_s <= nt < ws_e and ws_o != agent:
+                        hit = True
+                        break
+                if hit:
+                    continue
+            if has_cons:
+                if nt * nc_total + ncell in vcons:
+                    continue
+                if ncell != cell and (t * nc_total + cell) * nc_total + ncell in econs:
+                    continue
+            ns = s
+            o = vertex.get(nt * nc_total + ncell)
+            if o is None and pk:
+                p = pk.get(ncell)
+                if p is not None and nt >= p[1]:
+                    o = p[0]
+            if o is not None and o != agent and o not in ignore:
+                if hard is None or o in hard:
+                    continue
+                ns += 1
+            if ncell != cell:
+                o = edge.get((t * nc_total + ncell) * nc_total + cell)
+                if o is not None and o != agent and o not in ignore:
+                    if hard is None or o in hard:
+                        continue
+                    ns += 1
+            if cat_v is not None:
+                o = cat_v.get(nt * nc_total + ncell)
+                if o is not None and o != agent:
+                    ns += 1
+                if ncell != cell:
+                    o = cat_e.get((t * nc_total + ncell) * nc_total + cell)
+                    if o is not None and o != agent:
+                        ns += 1
+            nk = k
+            if k < G and goals[k] == ncell:
+                nk = advance(goals, k, ncell)
+            if dl_idx >= 0 and nk <= dl_idx:
+                if nt + dists[nk][ncell] + prefix[dl_idx] - prefix[nk] > dl_t:
+                    continue
+            nkey = (nt * nc_total + ncell) * G1 + nk
+            if nkey in closed:
                 continue
-            if not reservations.is_vertex_free(nxt, nt, agent):
+            prev = best_soft.get(nkey)
+            if prev is not None and prev <= ns:
                 continue
-            if nxt != cell and not reservations.is_edge_free(cell, nxt, t, agent):
-                continue
-            if blocked_vertices is not None and (nxt, nt) in blocked_vertices:
-                continue
-            if blocked_edges is not None and (cell, nxt, t) in blocked_edges:
-                continue
-            hn = dist[nxt]
-            if hn < 0:
-                continue
+            best_soft[nkey] = ns
+            parent[nkey] = key
+            hv = dists[nk][ncell] + rest[nk] if nk < G else last_d[ncell]
+            heappush(heap, (nt + hv, ns, -nt, nkey))
 
-            ng = g + 1.0 + (avoid_penalty if nxt in avoid else 0.0)
-            key = (nxt, nt)
-            if ng >= best_g.get(key, INF):
-                continue
-            best_g[key] = ng
-            parent[key] = (cell, t)
-            counter += 1
-            heapq.heappush(open_heap, (ng + hn, hn, counter, nxt, nt, ng))
-
-    return None
+    return SearchResult(INFEASIBLE, None, 0, expansions)
 
 
-def _can_hold(
-    goal: int,
-    t: int,
-    hold: int | None,
-    reservations: ReservationTable,
-    obstacles: DynamicObstacles,
-    agent: int,
-    *,
-    blocked_vertices: frozenset[tuple[int, int]] | None = None,
-) -> bool:
-    """Whether ``agent`` may occupy ``goal`` from ``t`` for the required duration.
-
-    ``hold is None`` means *forever*, which additionally requires that no other
-    agent ever passes through the cell afterwards.
-    """
-    if hold is None:
-        if obstacles.blocked_from(goal) != INF:
-            return False
-        if blocked_vertices:
-            # Parking here forever must not violate a constraint at any later
-            # time, so no constraint on this cell may sit at or after arrival.
-            if any(c == goal and ct >= t for c, ct in blocked_vertices):
-                return False
-        perm = reservations.permanent_owner(goal)
-        if perm is not None and perm[1] != agent:
-            return False
-        return t >= reservations.last_use(goal)
-
-    for k in range(hold + 1):
-        if obstacles.is_blocked(goal, t + k):
-            return False
-        if not reservations.is_vertex_free(goal, t + k, agent):
-            return False
-        if blocked_vertices is not None and (goal, t + k) in blocked_vertices:
-            return False
-    return True
-
-
-def _reconstruct(
-    agent: int,
-    start_time: int,
-    parent: dict[tuple[int, int], tuple[int, int]],
-    end: tuple[int, int],
-) -> Plan:
-    cells: list[int] = []
-    node = end
-    while node in parent:
-        cells.append(node[0])
-        node = parent[node]
-    cells.append(node[0])
-    cells.reverse()
-    return Plan(agent, start_time, tuple(cells))
-
-
-def plan_route(
-    grid: WarehouseGrid,
-    start: int,
-    waypoints: Sequence[int],
-    start_time: int,
-    agent: int,
-    reservations: ReservationTable,
-    obstacles: DynamicObstacles,
-    heuristics: HeuristicCache,
-    *,
-    service_time: int = 1,
-    avoid: frozenset[int] | set[int] | None = None,
-    avoid_penalty: float = 0.0,
-    max_expansions: int = DEFAULT_MAX_EXPANSIONS,
-    move_filter: Callable[[int, int], bool] | None = None,
-    blocked_vertices: frozenset[tuple[int, int]] | None = None,
-    blocked_edges: frozenset[tuple[int, int, int]] | None = None,
-) -> Plan | None:
-    """Plan a multi-leg route through ``waypoints``, servicing each in turn.
-
-    Each waypoint is held for ``service_time`` steps (the pick or the drop);
-    the final waypoint is held forever, so the agent parks there.  Legs are
-    planned in sequence with time carried forward -- the standard way to handle
-    a task sequence with Space-Time A* without blowing up the state space.
-    """
-    if not waypoints:
-        return Plan(agent, start_time, (start,))
-
-    cells: list[int] = [start]
-    current = start
-    t = start_time
-    last = len(waypoints) - 1
-
-    for i, waypoint in enumerate(waypoints):
-        hold: float = INF if i == last else service_time
-        leg = space_time_astar(
-            grid,
-            current,
-            waypoint,
-            t,
-            agent,
-            reservations,
-            obstacles,
-            heuristics,
-            hold=hold,
-            avoid=avoid,
-            avoid_penalty=avoid_penalty,
-            max_expansions=max_expansions,
-            move_filter=move_filter,
-            blocked_vertices=blocked_vertices,
-            blocked_edges=blocked_edges,
-        )
-        if leg is None:
+def _route_avoiding(grid: WarehouseGrid, cell: int, goals: tuple[int, ...], k: int,
+                    avoid: frozenset[int]) -> list[int] | None:
+    """Like :func:`static_route` but never entering ``avoid``; ``None`` if impossible."""
+    out = []
+    while k < len(goals):
+        target = goals[k]
+        if target in avoid:
             return None
+        prev = {cell: -1}
+        q = deque([cell])
+        while q and target not in prev:
+            u = q.popleft()
+            for v in grid.neighbors[u]:
+                if v not in prev and v not in avoid:
+                    prev[v] = u
+                    q.append(v)
+        if target not in prev:
+            return None
+        leg = []
+        v = target
+        while v != cell:
+            leg.append(v)
+            v = prev[v]
+        out += reversed(leg)
+        cell = target
+        k = advance(goals, k, cell)
+    return out
 
-        cells.extend(leg.cells[1:])
-        t = leg.end_time
-        current = waypoint
 
-        if i != last:
-            # Service the waypoint: stand still while picking or dropping.
-            for _ in range(service_time):
-                cells.append(waypoint)
-                t += 1
-
-    return Plan(agent, start_time, tuple(cells))
-
-
-def path_cost(plan: Plan) -> int:
-    """Time steps the agent spends executing ``plan``."""
-    return plan.duration
-
-
-def plans_conflict(a: Plan, b: Plan) -> bool:
-    """Whether two plans collide in space-time (vertex or edge/swap).
-
-    Both are treated as parking on their final cell forever, matching how the
-    reservation table interprets them.
-    """
-    if a.agent == b.agent:
-        return False
-
-    lo = min(a.start_time, b.start_time)
-    hi = max(a.end_time, b.end_time)
-
-    prev_a = a.at(lo)
-    prev_b = b.at(lo)
-    if prev_a == prev_b:
-        return True
-    for t in range(lo + 1, hi + 1):
-        cur_a = a.at(t)
-        cur_b = b.at(t)
-        if cur_a == cur_b:
-            return True
-        if cur_a == prev_b and cur_b == prev_a:
-            return True  # head-on swap
-        prev_a, prev_b = cur_a, cur_b
-    return False
+def _build(parent: dict[int, int], key: int, G1: int, nc: int, t0: int, tail: list[int]) -> Plan:
+    cells = []
+    while key != -1:
+        cells.append((key // G1) % nc)
+        key = parent[key]
+    cells.reverse()
+    return Plan(t0, tuple(cells + tail))

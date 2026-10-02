@@ -1,370 +1,270 @@
-"""Experiment sweeps.
+"""Experiments E1-E4 (see report/report.md for what each one answers).
 
-Answers the three questions the assignment asks, in order:
+    python experiments/run_experiments.py all --quick     # smoke test, minutes
+    python experiments/run_experiments.py all             # full study
+    python experiments/run_experiments.py single agents density slack exactness
+    python experiments/run_experiments.py all --jobs 8
 
-1. **Total time steps for all agents to finish their tasks** -- the headline
-   metric, per repair strategy.
-2. **Agents whose plans change per single disruption** -- the impact of plan
-   modification.
-3. **How both scale** with the number of agents and with the density of dynamic
-   obstacles.
+E1 ``single``     one disruption injected into a running plan; every strategy
+                  repairs the identical state.  -> agents changed per disruption
+E2a ``agents``    full episodes, number of agents varied.  -> total time, scaling
+E2b ``density``   full episodes, obstacle density varied.   -> total time, scaling
+E3 ``slack``      emergency deadline slack varied.          -> changes vs lateness
+E4 ``exactness``  KR-CBS against a brute-force oracle on small instances.
 
-Plus secondary sweeps over the parameters that control the trade-off: ``beta``
-(the penalty for changing a plan at all), ``tau`` (PGP's dampening threshold),
-ADOPT's error bound ``epsilon``, the neighbourhood cap ``k_max``, and whether
-social laws are in force.
-
-Every configuration is run over many seeds.  Crucially, all four strategies see
-the *same* scenarios and the *same* disruption schedules: the initial joint plan
-is computed once per ``(n_agents, seed)`` and replayed, so differences in the
-results come from the repair strategy and nothing else.
-
-Usage::
-
-    python experiments/run_experiments.py --quick     # seconds, for a smoke test
-    python experiments/run_experiments.py             # the full sweep
-    python experiments/run_experiments.py --jobs 4    # limit parallelism
+Every job is deterministic in its seed and is written as one JSON line as soon
+as it finishes, so an interrupted run resumes where it stopped.  All strategies
+see the same instance, initial plan and disruptions.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import itertools
+import json
+import multiprocessing as mp
 import os
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from warehouse import scenario  # noqa: E402
-from warehouse.metrics import RunMetrics, aggregate  # noqa: E402
-from warehouse.repair import RepairConfig  # noqa: E402
-from warehouse.simulator import simulate  # noqa: E402
+from warehouse.disruptions import KINDS, EventRates, make_schedule, sample_single  # noqa: E402
+from warehouse.plan import plan_distance, plans_differ  # noqa: E402
+from warehouse.repair import STRATEGIES, repair  # noqa: E402
+from warehouse.repair.cbs import brute_force_min_change  # noqa: E402
+from warehouse.scenario import STREAM_SINGLE, make_instance, rng_for  # noqa: E402
+from warehouse.simulator import (SimConfig, World, apply_event, initial_plans,  # noqa: E402
+                                 make_context, run_episode)
+from warehouse.stastar import advance  # noqa: E402
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
 
-STRATEGIES = ("selfish", "greedy_pgp", "adopt", "cbs", "full_replan")
+FULL = dict(
+    agents=[10, 20, 30, 40, 50], densities=[0.0, 0.01, 0.02, 0.04, 0.08],
+    base_n=30, base_rho=0.02, seeds=20, single_samples=100,
+    slacks=[0, 2, 5, 10, None], slack_samples=100, slack_n=30,
+    exact_agents=[4, 6, 8], exact_samples=70,
+)
+QUICK = dict(
+    agents=[10, 30], densities=[0.0, 0.04], base_n=20, base_rho=0.02, seeds=2,
+    single_samples=4, slacks=[0, None], slack_samples=4, slack_n=20,
+    exact_agents=[4], exact_samples=6,
+)
 
 
-@dataclass(frozen=True)
-class Job:
-    """One simulation to run."""
-
-    strategy: str
-    n_agents: int
-    density: float
-    seed: int
-    beta: float = 4.0
-    tau: int = 0
-    k_max: int = 6
-    epsilon: float = 0.0
-    social_laws: bool = False
-    tasks_per_agent: int = 3
-    rows: int = 50
-    cols: int = 60
-    sweep: str = "main"
+# ------------------------------------------------------------------ helpers
+def _world_at(n_agents: int, seed: int, preset: str = "main"):
+    """Instance + initial plan, advanced (undisrupted) to a random time."""
+    inst = make_instance(n_agents, seed, preset=preset)
+    plans = initial_plans(inst)
+    world = World(inst, plans)
+    rng = rng_for(seed, STREAM_SINGLE)
+    makespan = max(p.end for p in plans.values())
+    t_d = int(rng.integers(max(1, int(0.1 * makespan)), max(2, int(0.7 * makespan))))
+    while world.t < t_d:
+        world.step()
+    return world, rng
 
 
-@dataclass
-class Grids:
-    """Lazily built, process-local grid cache.
-
-    A grid is a few megabytes of precomputed adjacency and is immutable, so one
-    instance per worker process is reused across every job it runs.
-    """
-
-    _cache: dict[tuple[int, int], Any] = field(default_factory=dict)
-
-    def get(self, rows: int, cols: int):
-        key = (rows, cols)
-        if key not in self._cache:
-            self._cache[key] = scenario.make_grid(n_rows=rows, n_cols=cols)
-        return self._cache[key]
+def _delivery_time(world: World, a: int, plan, goal_idx: int) -> int | None:
+    st = world.agents[a]
+    k = st.progress
+    for i, c in enumerate(plan.cells):
+        k = advance(st.mission.goals, k, c)
+        if k > goal_idx:
+            return plan.t0 + i
+    return None
 
 
-_GRIDS = Grids()
-
-
-def run_job(job: Job) -> dict[str, Any]:
-    """Execute one configuration and return its metrics as a CSV row."""
-    grid = _GRIDS.get(job.rows, job.cols)
-    sc = scenario.build(
-        grid,
-        job.n_agents,
-        job.seed,
-        tasks_per_agent=job.tasks_per_agent,
-        social_laws=job.social_laws,
+def _repair_once(world: World, ev, strategy: str, cfg: SimConfig) -> dict | None:
+    """Apply ``ev`` to a copy of ``world`` and repair it with ``strategy``."""
+    w = world.copy()
+    status, forced, cell = apply_event(w, ev, cfg)
+    if status != "applied" or not forced:
+        return None
+    ctx = make_context(w, forced, cell, cfg)
+    t0 = time.perf_counter()
+    res = repair(strategy, ctx)
+    runtime = time.perf_counter() - t0
+    out = {"forced": len(forced), "level": res.level, "exact": res.exact,
+           "runtime_s": runtime, "ok": res.ok, "hl_nodes": res.hl_nodes,
+           "ll_calls": res.session.ll_calls, "ll_expansions": res.session.ll_expansions,
+           "deadline_relaxed": res.deadline_relaxed}
+    if not res.ok:
+        return out
+    changed = res.session.close(ctx.plans, res.plans, ctx.t)
+    out.update(
+        changed=len(changed), collateral=len(changed - set(forced)),
+        contacted=len(res.session.contacted), messages=res.session.n_messages,
+        plan_distance=sum(plan_distance(ctx.plans[a], res.plans[a], ctx.t) for a in changed),
+        soc_delta=sum(res.plans[a].end - ctx.plans[a].end for a in changed),
     )
-    config = RepairConfig(
-        k_max=job.k_max, beta=job.beta, tau=job.tau, epsilon=job.epsilon
-    )
-
-    started = time.perf_counter()
-    result = simulate(
-        grid,
-        sc.fresh_tasks(),
-        sc.solution,
-        sc.disruptions(density=job.density),
-        strategy=job.strategy,
-        config=config,
-        seed=job.seed,
-        move_filter=sc.move_filter,
-    )
-    metrics: RunMetrics = result.metrics
-    metrics.density = job.density
-    metrics.social_laws = job.social_laws
-
-    row = metrics.as_row()
-    row["sweep"] = job.sweep
-    row["wall_s"] = round(time.perf_counter() - started, 3)
-    return row
+    if ev.kind == "emergency":
+        e = forced[0]
+        st = w.agents[e]
+        plan = res.plans.get(e, ctx.plans[e])
+        out["emergency_lateness"] = _delivery_time(w, e, plan, st.deadline[0]) - st.emergency_earliest
+    return out
 
 
-# ------------------------------------------------------------------- sweeps
-
-
-def main_sweep(seeds: Sequence[int], agents: Sequence[int], densities: Sequence[float]):
-    """Strategy x agent count x obstacle density -- the assignment's core question."""
-    for n, density, strategy, seed in itertools.product(
-        agents, densities, STRATEGIES, seeds
-    ):
-        yield Job(
-            strategy=strategy,
-            n_agents=n,
-            density=density,
-            seed=seed,
-            sweep="main",
-        )
-
-
-def parameter_sweeps(seeds: Sequence[int], n_agents: int, density: float):
-    """The knobs that control the cost/churn trade-off, one at a time."""
-    for seed in seeds:
-        # beta: the penalty for altering a plan at all.
-        for beta in (0.0, 1.0, 2.0, 4.0, 10.0, 25.0, 60.0):
-            yield Job("adopt", n_agents, density, seed, beta=beta, sweep="beta")
-
-        # tau: PGP's dampened responsiveness.
-        for tau in (0, 2, 5, 10, 25):
-            yield Job("adopt", n_agents, density, seed, tau=tau, sweep="tau")
-
-        # epsilon: ADOPT's error bound -- optimality traded for cycles.
-        for epsilon in (0.0, 2.0, 10.0, 50.0):
-            yield Job("adopt", n_agents, density, seed, epsilon=epsilon, sweep="epsilon")
-
-        # k_max: how far a single disruption may propagate.
-        for k_max in (2, 4, 6, 8, 10):
-            yield Job("adopt", n_agents, density, seed, k_max=k_max, sweep="k_max")
-
-        # Social laws on/off, for every strategy.
-        for strategy in STRATEGIES:
-            for laws in (False, True):
-                yield Job(
-                    strategy, n_agents, density, seed, social_laws=laws, sweep="social_laws"
-                )
-
-
-def build_jobs(quick: bool) -> list[Job]:
-    if quick:
-        seeds = (1, 2, 3)
-        jobs = list(main_sweep(seeds, agents=(10, 20), densities=(0.0, 0.02)))
-        jobs += list(parameter_sweeps(seeds[:2], n_agents=15, density=0.02))
-        return jobs
-
-    # Density is the fraction of *free* cells that become permanently blocked
-    # during the run.  The warehouse has ~1650 free cells, so 0.04 already walls
-    # off about 65 of them -- a severe incident, not a mild one.  Going much
-    # beyond that stops measuring plan repair and starts measuring how long a
-    # destroyed warehouse takes to grind to a halt.
-    #
-    # Twelve seeds rather than thirty: the whole grid has to finish, and the
-    # 80-agent full-replan cells cost seconds each.  Twelve still gives usable
-    # confidence intervals on every point.
-    seeds = tuple(range(1, 13))
-    jobs = list(
-        main_sweep(
-            seeds,
-            agents=(10, 20, 30, 40, 60, 80),
-            densities=(0.0, 0.01, 0.02, 0.03, 0.04),
-        )
-    )
-    jobs += list(parameter_sweeps(seeds[:8], n_agents=30, density=0.02))
-    return jobs
-
-
-# -------------------------------------------------------------------- driver
-
-
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    fields: list[str] = []
-    for row in rows:
-        for key in row:
-            if key not in fields:
-                fields.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def execute(
-    jobs: list[Job],
-    jobs_parallel: int,
-    *,
-    checkpoint: Path | None = None,
-    every: int = 25,
-) -> list[dict[str, Any]]:
-    """Run every job, checkpointing results to disk as they complete.
-
-    The sweep takes tens of minutes, so writing only at the end makes it
-    all-or-nothing: an interrupted run loses everything it had already computed.
-    Rows are flushed to ``checkpoint`` every ``every`` completions instead, which
-    costs almost nothing (the file is a few megabytes) and means a partial run is
-    still a usable partial result.
-    """
-    rows: list[dict[str, Any]] = []
-    started = time.perf_counter()
-    total = len(jobs)
-
-    def flush() -> None:
-        if checkpoint is not None and rows:
-            write_csv(checkpoint, rows)
-
-    if jobs_parallel <= 1:
-        for index, job in enumerate(jobs, 1):
-            rows.append(run_job(job))
-            if index % every == 0:
-                flush()
-            _progress(index, total, started)
-        flush()
-        return rows
-
-    # Sorted longest-first so the big configurations start early and the tail
-    # of the run is not one 80-agent job finishing alone.
-    ordered = sorted(jobs, key=lambda j: -j.n_agents)
-    from concurrent.futures import ProcessPoolExecutor
-
-    with ProcessPoolExecutor(max_workers=jobs_parallel) as pool:
-        for index, row in enumerate(pool.map(run_job, ordered, chunksize=2), 1):
-            rows.append(row)
-            if index % every == 0:
-                flush()
-            _progress(index, total, started)
-    flush()
+# --------------------------------------------------------------------- jobs
+def job_single(n_agents: int, kind: str, sample: int) -> list[dict]:
+    seed = 10_000 + sample
+    world, rng = _world_at(n_agents, seed)
+    ev = sample_single(world, kind, rng)
+    if ev is None:
+        return [{"exp": "single", "n_agents": n_agents, "kind": kind, "sample": sample,
+                 "skipped": True}]
+    rows = []
+    for strategy in STRATEGIES:
+        r = _repair_once(world, ev, strategy, SimConfig(strategy=strategy, emergency_slack=0))
+        if r is None:
+            return [{"exp": "single", "n_agents": n_agents, "kind": kind, "sample": sample,
+                     "skipped": True}]
+        rows.append({"exp": "single", "n_agents": n_agents, "kind": kind, "sample": sample,
+                     "strategy": strategy, "t": world.t, **r})
     return rows
 
 
-def _progress(index: int, total: int, started: float) -> None:
-    if index % 25 and index != total:
-        return
-    # NB: printing unbuffered matters -- piping this through `tail` hides it.
-    elapsed = time.perf_counter() - started
-    rate = index / elapsed if elapsed else 0
-    remaining = (total - index) / rate if rate else 0
-    print(
-        f"  {index:5d}/{total}  {elapsed/60:5.1f} min elapsed, "
-        f"~{remaining/60:4.1f} min left",
-        flush=True,
-    )
+def job_slack(n_agents: int, slack, sample: int) -> list[dict]:
+    seed = 20_000 + sample
+    world, rng = _world_at(n_agents, seed)
+    ev = sample_single(world, "emergency", rng)
+    if ev is None:
+        return [{"exp": "slack", "slack": slack, "sample": sample, "skipped": True}]
+    rows = []
+    for strategy in ("krcbs", "local", "global"):
+        r = _repair_once(world, ev, strategy, SimConfig(strategy=strategy, emergency_slack=slack))
+        if r is None:
+            return [{"exp": "slack", "slack": slack, "sample": sample, "skipped": True}]
+        rows.append({"exp": "slack", "n_agents": n_agents, "slack": slack, "sample": sample,
+                     "strategy": strategy, **r})
+    return rows
 
 
-def summarise(rows: list[dict[str, Any]]) -> None:
-    """Print the headline comparison so the run is readable without the CSVs."""
-    main = [r for r in rows if r["sweep"] == "main" and r["density"] > 0]
-    if not main:
-        return
+def job_episode(exp: str, n_agents: int, rho: float, seed: int, strategy: str) -> list[dict]:
+    inst = make_instance(n_agents, seed)
+    plans = initial_plans(inst)
+    horizon = max(p.end for p in plans.values())
+    events = make_schedule(inst, horizon, EventRates(rho=rho), seed)
+    r = run_episode(inst, plans, events, SimConfig(strategy=strategy, emergency_slack=0))
+    reps = r.repairs
+    compact = [[x["kind"], x["forced"], x["changed"], x["collateral"], x.get("level"),
+                x.get("exact"), x.get("messages", 0), x.get("contacted", 0),
+                x.get("plan_distance", 0), round(x.get("runtime_s", 0.0), 4)]
+               for x in reps]
+    return [{
+        "exp": exp, "n_agents": n_agents, "rho": rho, "seed": seed, "strategy": strategy,
+        "completed": r.completed, "soc": r.soc, "soc0": r.soc0, "makespan": r.makespan,
+        "makespan0": horizon, "agents_done": r.agents_done, "deliveries_done": r.deliveries_done,
+        "n_events": len(events), "n_repairs": len(reps),
+        "levels": dict(r.levels), "realized_density": r.realized_density,
+        "emergency_lateness": r.emergency_lateness, "runtime_s": r.runtime_s,
+        "repairs": compact,
+    }]
 
-    print("\n" + "=" * 78)
-    print("Headline: repair strategy comparison (disrupted runs, all densities)")
-    print("=" * 78)
-    print(
-        f"{'strategy':14s} {'total steps':>12s} {'chg/disrupt':>12s} "
-        f"{'involved':>9s} {'ms/repair':>10s} {'done':>7s} {'stranded':>9s}"
-    )
-    for strategy in STRATEGIES:
-        group = [r for r in main if r["strategy"] == strategy]
-        if not group:
-            continue
 
-        def avg(key: str) -> float:
-            return sum(float(r[key]) for r in group) / len(group)
+def job_exactness(n_agents: int, sample: int) -> list[dict]:
+    seed = 30_000 + sample
+    world, rng = _world_at(n_agents, seed, preset="small")
+    kind = KINDS[sample % 3]
+    ev = sample_single(world, kind, rng)
+    base = {"exp": "exactness", "n_agents": n_agents, "sample": sample, "kind": kind}
+    if ev is None:
+        return [{**base, "skipped": True}]
+    cfg = SimConfig(strategy="krcbs", emergency_slack=0)
+    w = world.copy()
+    status, forced, cell = apply_event(w, ev, cfg)
+    if status != "applied" or not forced:
+        return [{**base, "skipped": True}]
+    ctx = make_context(w, forced, cell, cfg)
+    t0 = time.perf_counter()
+    res = repair("krcbs", ctx)
+    t_kr = time.perf_counter() - t0
+    changed = {a for a, p in res.plans.items() if plans_differ(ctx.plans[a], p, ctx.t)}
+    soc = ctx.base_soc + sum(res.plans[a].end - ctx.plans[a].end for a in changed)
+    t0 = time.perf_counter()
+    try:
+        best = brute_force_min_change(ctx)
+        bf_error = None
+    except RuntimeError as exc:
+        best, bf_error = None, str(exc)
+    t_bf = time.perf_counter() - t0
+    return [{**base, "forced": len(forced), "kr_changed": len(changed), "kr_soc": soc,
+             "kr_level": res.level, "kr_exact": res.exact, "kr_runtime_s": t_kr,
+             "bf_changed": best[0] if best else None, "bf_soc": best[1] if best else None,
+             "bf_runtime_s": t_bf, "bf_error": bf_error}]
 
-        print(
-            f"{strategy:14s} {avg('total_timesteps'):12.0f} "
-            f"{avg('mean_agents_changed'):12.2f} {avg('mean_agents_involved'):9.2f} "
-            f"{avg('mean_repair_ms'):10.1f} {avg('completion_rate'):7.2%} "
-            f"{avg('agents_stranded'):9.2f}"
-        )
-    print("=" * 78)
+
+# ------------------------------------------------------------------ driver
+def build_jobs(which: list[str], P: dict) -> dict[str, list[tuple]]:
+    jobs: dict[str, list[tuple]] = {}
+    if "single" in which:
+        jobs["e1_single"] = [("single", n, k, s) for n in P["agents"] for k in KINDS
+                             for s in range(P["single_samples"])]
+    if "agents" in which:
+        jobs["e2a_agents"] = [("episode", "agents", n, P["base_rho"], s, st)
+                              for n in P["agents"] for s in range(P["seeds"]) for st in STRATEGIES]
+    if "density" in which:
+        jobs["e2b_density"] = [("episode", "density", P["base_n"], rho, s, st)
+                               for rho in P["densities"] for s in range(P["seeds"])
+                               for st in STRATEGIES]
+    if "slack" in which:
+        jobs["e3_slack"] = [("slack", P["slack_n"], d, s) for d in P["slacks"]
+                            for s in range(P["slack_samples"])]
+    if "exactness" in which:
+        jobs["e4_exactness"] = [("exactness", n, s) for n in P["exact_agents"]
+                                for s in range(P["exact_samples"])]
+    return jobs
+
+
+def run_job(job: tuple) -> tuple[tuple, list[dict]]:
+    kind, *args = job
+    fn = {"single": job_single, "episode": job_episode, "slack": job_slack,
+          "exactness": job_exactness}[kind]
+    return job, fn(*args)
+
+
+def job_key(job: tuple) -> str:
+    return json.dumps(list(job))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--quick", action="store_true", help="tiny sweep for a smoke test"
-    )
-    parser.add_argument(
-        "--jobs",
-        type=int,
-        default=max(1, (os.cpu_count() or 2) - 1),
-        help="worker processes (1 disables parallelism)",
-    )
-    parser.add_argument("--out", type=Path, default=RESULTS)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("which", nargs="+",
+                    choices=["all", "single", "agents", "density", "slack", "exactness"])
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--out", type=Path, default=RESULTS)
+    args = ap.parse_args()
+    which = ["single", "agents", "density", "slack", "exactness"] if "all" in args.which else args.which
+    P = QUICK if args.quick else FULL
+    out_dir = args.out / ("quick" if args.quick else "")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    jobs = build_jobs(args.quick)
-    print(
-        f"Running {len(jobs)} simulations "
-        f"({'quick' if args.quick else 'full'} sweep) on {args.jobs} worker(s)",
-        flush=True,
-    )
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    rows = execute(jobs, args.jobs, checkpoint=args.out / "runs.csv")
-    write_csv(args.out / "runs.csv", rows)
-
-    main_rows = [r for r in rows if r["sweep"] == "main"]
-    metrics_by_key = aggregate(
-        [_as_metrics(r) for r in main_rows], "strategy", "n_agents", "density"
-    )
-    write_csv(args.out / "summary_main.csv", metrics_by_key)
-
-    for sweep in ("beta", "tau", "epsilon", "k_max", "social_laws"):
-        subset = [r for r in rows if r["sweep"] == sweep]
-        if subset:
-            write_csv(args.out / f"summary_{sweep}.csv", subset)
-
-    summarise(rows)
-    print(f"\nWrote {len(rows)} rows to {args.out}")
-
-
-def _as_metrics(row: dict[str, Any]) -> RunMetrics:
-    """Rebuild a metrics object from a CSV row, for the aggregation helper."""
-    metrics = RunMetrics(
-        strategy=row["strategy"],
-        n_agents=int(row["n_agents"]),
-        density=float(row["density"]),
-        seed=int(row["seed"]),
-    )
-    metrics.total_timesteps = int(row["total_timesteps"])
-    metrics.makespan = int(row["makespan"])
-    metrics.repair_failures = int(row["repair_failures"])
-    # The aggregator reads these through properties, so seed the backing lists
-    # with a single representative value each.
-    metrics.agents_changed = [float(row["mean_agents_changed"])]
-    metrics.agents_involved = [float(row["mean_agents_involved"])]
-    metrics.repair_ms = [float(row["mean_repair_ms"])]
-    metrics.repair_messages = [float(row["mean_repair_messages"])]
-    metrics.tasks_completed = int(row["tasks_completed"])
-    metrics.tasks_total = int(row["tasks_total"])
-    return metrics
+    for name, jobs in build_jobs(which, P).items():
+        path = out_dir / f"{name}.jsonl"
+        done = set()
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    done.add(json.loads(line)["job"])
+        todo = [j for j in jobs if job_key(j) not in done]
+        # longest jobs first keeps the pool busy at the end
+        todo.sort(key=lambda j: -(j[2] if isinstance(j[2], int) else 0))
+        print(f"{name}: {len(jobs)} jobs, {len(done)} already done, {len(todo)} to run", flush=True)
+        if not todo:
+            continue
+        t0 = time.perf_counter()
+        with path.open("a", encoding="utf-8") as fh, mp.Pool(args.jobs) as pool:
+            for i, (job, rows) in enumerate(pool.imap_unordered(run_job, todo), 1):
+                for row in rows:
+                    row["job"] = job_key(job)
+                    fh.write(json.dumps(row) + "\n")
+                fh.flush()
+                if i % max(1, len(todo) // 20) == 0 or i == len(todo):
+                    print(f"  {name}: {i}/{len(todo)}  {time.perf_counter() - t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

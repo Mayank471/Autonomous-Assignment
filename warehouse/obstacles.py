@@ -1,90 +1,66 @@
-"""Dynamic obstacles: cells that become permanently impassable during execution.
+"""Dynamic obstacles as time windows on cells.
 
-A blockage is *permanent from a known time* rather than transient.  That is the
-harder case for plan repair -- an agent cannot simply wait it out -- and it is
-what the assignment's "sudden blockage of some grid cell" describes.  A broken
-down agent is modelled the same way: its cell blocks from the moment it fails.
+Two disruption types produce windows:
+
+* a sudden **blockage** of cell ``c`` for ``d`` steps -> window ``[t, t+d)``
+  with ``owner = -1``;
+* a **breakdown** of agent ``b`` -> its cell is blocked while ``b`` is frozen,
+  with ``owner = b`` (the broken agent itself is of course allowed to be there).
+
+Durations are announced when the disruption starts, so planners can route
+around a window or wait for it to clear.
 """
 
 from __future__ import annotations
 
-from typing import Iterator
-
-INF = float("inf")
+from dataclasses import dataclass, field
 
 
-class DynamicObstacles:
-    """Cells blocked from a given time onward, with a version stamp.
+@dataclass
+class ObstacleWindows:
+    windows: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
 
-    The version increments on every change so that caches keyed on the obstacle
-    set (notably :class:`~warehouse.stastar.HeuristicCache`) can tell when they
-    have gone stale.
-    """
+    def add(self, cell: int, start: int, end: int, owner: int = -1) -> None:
+        """Block ``cell`` for ``start <= t < end``."""
+        self.windows.setdefault(cell, []).append((start, end, owner))
 
-    __slots__ = ("_from", "_version")
-
-    def __init__(self) -> None:
-        self._from: dict[int, int] = {}
-        self._version: int = 0
-
-    @property
-    def version(self) -> int:
-        return self._version
-
-    def __len__(self) -> int:
-        return len(self._from)
-
-    def __iter__(self) -> Iterator[int]:
-        return iter(self._from)
-
-    def __contains__(self, cell: int) -> bool:
-        return cell in self._from
-
-    def block(self, cell: int, from_time: int) -> bool:
-        """Block ``cell`` from ``from_time``.
-
-        Returns ``True`` if this tightened the constraint (new cell, or an
-        earlier start time than previously recorded).
-        """
-        prev = self._from.get(cell)
-        if prev is not None and prev <= from_time:
+    def blocked(self, cell: int, t: int, agent: int = -2) -> bool:
+        ws = self.windows.get(cell)
+        if not ws:
             return False
-        self._from[cell] = from_time
-        self._version += 1
-        return True
+        for s, e, owner in ws:
+            if s <= t < e and owner != agent:
+                return True
+        return False
 
-    def unblock(self, cell: int) -> bool:
-        """Remove the blockage on ``cell``; returns whether anything changed."""
-        if self._from.pop(cell, None) is None:
-            return False
-        self._version += 1
-        return True
+    def last_time(self) -> int:
+        """Latest time at which anything is blocked (0 if nothing)."""
+        return max((e - 1 for ws in self.windows.values() for _, e, _ in ws), default=0)
 
-    def blocked_from(self, cell: int) -> float:
-        """Time from which ``cell`` is impassable, or ``inf`` if never."""
-        return self._from.get(cell, INF)
+    def blocked_after(self, cell: int, t: int, agent: int = -2) -> bool:
+        """Is ``cell`` blocked at any time strictly after ``t``?"""
+        return any(e - 1 > t and owner != agent for _, e, owner in self.windows.get(cell, ()))
 
-    def is_blocked(self, cell: int, t: int) -> bool:
-        """Whether ``cell`` is impassable at time ``t``."""
-        start = self._from.get(cell)
-        return start is not None and t >= start
+    def prune(self, t_now: int) -> None:
+        for cell in list(self.windows):
+            kept = [w for w in self.windows[cell] if w[1] > t_now]
+            if kept:
+                self.windows[cell] = kept
+            else:
+                del self.windows[cell]
 
-    def blocked_by(self, t: int) -> set[int]:
-        """Cells already blocked at time ``t``."""
-        return {cell for cell, start in self._from.items() if start <= t}
-
-    def all_cells(self) -> set[int]:
-        """Every cell that is or will become blocked."""
-        return set(self._from)
+    def active_count(self, t: int, owner_filter: int | None = -1) -> int:
+        """Number of cells blocked at time ``t`` (by blockages only, by default)."""
+        n = 0
+        for ws in self.windows.values():
+            if any(s <= t < e and (owner_filter is None or o == owner_filter) for s, e, o in ws):
+                n += 1
+        return n
 
     def items(self):
-        return self._from.items()
+        for cell, ws in self.windows.items():
+            for s, e, o in ws:
+                yield cell, s, e, o
 
-    def copy(self) -> "DynamicObstacles":
-        other = DynamicObstacles()
-        other._from = dict(self._from)
-        other._version = self._version
-        return other
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
-        return f"DynamicObstacles({len(self._from)} cells)"
+    def copy(self) -> "ObstacleWindows":
+        return ObstacleWindows({c: list(ws) for c, ws in self.windows.items()})
